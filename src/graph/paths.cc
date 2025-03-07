@@ -245,10 +245,12 @@ ncclResult_t ncclGetLevel(int* level, const char* disableEnv, const char* levelE
   return ncclSuccess;
 }
 
+// TODO(anonymous): honor
 NCCL_PARAM(IgnoreDisabledP2p, "IGNORE_DISABLED_P2P", 0);
 
 int ncclTopoUserP2pLevel = -1;
-ncclResult_t ncclTopoCheckP2p(struct ncclTopoSystem* system, int64_t id1, int64_t id2, int* p2p, int *read, int* intermediateRank) {
+ncclResult_t ncclTopoCheckP2p(struct ncclTopoSystem* system, int64_t id1, int64_t id2, int* p2p, int *read, int* intermediateRank,
+  bool native, int32_t tuner_p2pLevel/*-1*/, int* currP2pLevel/*NULL*/) {
   *p2p = 0;
   if (read) *read = 0;
   if (intermediateRank) *intermediateRank = -1;
@@ -275,6 +277,15 @@ ncclResult_t ncclTopoCheckP2p(struct ncclTopoSystem* system, int64_t id1, int64_
 
   // In general, use P2P whenever we can.
   int p2pLevel = PATH_SYS;
+  if (currP2pLevel) *currP2pLevel = path->type;
+#if TRANSPORT_NUM > 1
+  if (native == false) {
+    if (tuner_p2pLevel != -1) {
+      p2pLevel = tuner_p2pLevel;
+    }
+    goto compare; // for tuner
+  }
+#endif
 
   // User override
   if (ncclTopoUserP2pLevel == -1)
@@ -378,6 +389,7 @@ ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* system, int64_t busId, int 
 
   // Check if we are close enough that it makes sense to enable GDR
   int netGdrLevel = PATH_PXB;
+  // TODO: make it tunable
   NCCLCHECK(ncclGetLevel(&ncclTopoUserGdrLevel, NULL, "NCCL_NET_GDR_LEVEL"));
   if (ncclTopoUserGdrLevel != -2) netGdrLevel = ncclTopoUserGdrLevel;
   int distance = gpu->paths[NET][n].type;
@@ -547,7 +559,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   for (int g=0; g<system->nodes[GPU].count; g++) {
     for (int p=0; p<system->nodes[GPU].count; p++) {
       int p2p;
-      NCCLCHECK(ncclTopoCheckP2p(system, system->nodes[GPU].nodes[p].id, system->nodes[GPU].nodes[g].id, &p2p, NULL, NULL));
+      NCCLCHECK(ncclTopoCheckP2p(system, system->nodes[GPU].nodes[p].id, system->nodes[GPU].nodes[g].id, &p2p, NULL, NULL, (*comm->tunerEnvs)["tuner_extraP2PCE_disable"] && (*comm->tunerEnvs)["tuner_extraSHM_disable"], (*comm->tunerEnvs)["tuner_p2pLevel"]));
       if (p2p == 0) {
         // Divert all traffic through the CPU
         int cpu;

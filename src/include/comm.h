@@ -10,6 +10,7 @@
 #include "transport.h"
 #include "p2p.h"
 #include "collectives.h"
+#include "nccl_tuner.h"
 #include "proxy.h"
 #include "strongstream.h"
 
@@ -99,10 +100,10 @@ struct ncclCommCallback {
 struct ncclSharedResources {
   int refCount;
   struct ncclComm* owner; /* comm which creates this shared res. */
-  struct ncclChannelPeer* peers[MAXCHANNELS];
-  struct ncclDevChannelPeer* devPeers[MAXCHANNELS];
+  struct ncclChannelPeer* peers[TUNER_MAXCHANNELS];
+  struct ncclDevChannelPeer* devPeers[TUNER_MAXCHANNELS];
   /* P2P operation counter, one per channel */
-  uint64_t p2pOpCount[MAXCHANNELS];
+  uint64_t p2pOpCount[TUNER_MAXCHANNELS];
   /* Collective operation counter */
   uint64_t collOpCount;
   int tpNRanks;
@@ -124,6 +125,8 @@ struct ncclSharedResources {
 struct ncclChannel {
   struct ncclChannelPeer** peers;
   struct ncclDevChannelPeer** devPeers;
+  /* devPeer pointer array used for host side access */
+  struct ncclDevChannelPeer** devPeersHostPtr; 
   struct ncclRing ring;
   int* devRingUserRanks;
   struct ncclTree tree;
@@ -152,7 +155,9 @@ struct ncclPointerList {
   struct ncclPointerList* next;
   void *ptr;
 };
-
+#define MASK_BITWIDTH 8*sizeof(uint64_t)
+#define MASK_ARRAY ((TUNER_MAXCHANNELS + MASK_BITWIDTH -1) / MASK_BITWIDTH)
+struct ChannelMask;
 struct ncclKernelPlan {
   // A kernel plan is also a callback that reclaims itself. Hence this must
   // be the first member.
@@ -167,7 +172,7 @@ struct ncclKernelPlan {
   void *kernelFn;
   int channelUbound; // only channels c < channelUbound are present
   int channelCount; // number of channels present
-  uint64_t channelMask; // which channels are present, channelCount == popcount(channelMask)
+  ChannelMask channelMasks; // which channels are present, channelCount == popcount(channelMask)
   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue
   int threadPerBlock;
   // workHeap fields are null until uploadWorkFifo() or preparePersistentKernel()
@@ -186,7 +191,7 @@ struct ncclKernelPlan {
     size_t collBytes;
     struct ncclIntruQueue<struct ncclWorkList, &ncclWorkList::next> workQueue;
     struct ncclIntruQueue<struct ncclProxyOp, &ncclProxyOp::enqNext> proxyOpQueue;
-  } channels[MAXCHANNELS];
+  } channels[TUNER_MAXCHANNELS];
 };
 
 struct ncclComm {
@@ -198,7 +203,7 @@ struct ncclComm {
   /* map to top parent ranks. */
   int* topParentRanks;
   int* topParentLocalRanks;
-  struct ncclChannel channels[MAXCHANNELS];
+  struct ncclChannel channels[TUNER_MAXCHANNELS];
   struct ncclPeerInfo* peerInfo;
   struct ncclTopoSystem* topo;
 
@@ -206,8 +211,8 @@ struct ncclComm {
   ncclCollNet_t* ncclCollNet;
   void* bootstrap;
   // Bitmasks for ncclTransportP2pSetup
-  uint64_t* connectSend;
-  uint64_t* connectRecv;
+  bool (*connectSend)[TUNER_MAXCHANNELS];
+  bool (*connectRecv)[TUNER_MAXCHANNELS];
 
   uint64_t magic; // Magic number for all network communication. Not a security key -- only goal is to detect mismatches.
 
@@ -246,7 +251,9 @@ struct ncclComm {
   // Channels (per peer) for p2p
   int p2pnChannels;
   int p2pnChannelsPerPeer;
-  int p2pChannels[MAXCHANNELS];
+  int p2pChannels[TUNER_MAXCHANNELS];
+  int p2pSlotsForTuner[TUNER_MAXCHANNELS*NCCL_MAX_WORK_ELEMENTS_P2P];
+  int p2pChannelsForTuner[TUNER_MAXCHANNELS];
 
   // Should this comm allocate LL buffers for network P2P connections?
   bool allocP2pNetLLBuffers;
@@ -344,6 +351,10 @@ struct ncclComm {
   bool finalizeCalled;
   // shared structures for finalization
   int finalizeRankCnt;
+
+  // Tuning plugin
+  ncclTuner_t* tuner;
+  std::map<std::string, int32_t>* tunerEnvs;
 };
 
 enum ncclLaunchMode {

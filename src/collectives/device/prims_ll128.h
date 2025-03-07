@@ -5,6 +5,9 @@
  ************************************************************************/
 
 #include "op128.h"
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
 
 #define NCCL_LL128_FLAGTHREAD (NCCL_LL128_LINEELEMS-1)
 
@@ -42,6 +45,22 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
   uint64_t* recvBuff[MaxRecv];
   uint64_t* sendBuff[MaxSend];
 
+#if defined(ENABLE_NPKIT)
+public:
+  int npKitCtxIdx = 0;
+  uint64_t npKitDataProcessEntryTime = 0;
+  uint64_t npKitDataProcessExitTime = 0;
+  uint64_t npKitDataProcessTotalTime = 0;
+private:
+#endif
+
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+  uint64_t npKitWaitRecvDataProcessSize = 0;
+  uint64_t npKitWaitRecvEntryTime = 0;
+  uint64_t npKitWaitRecvExitTime = 0;
+  uint64_t npKitWaitRecvTotalTime = 0;
+#endif
+
   inline __device__ int recvOffset(int i) { return (recvStep[i]%NCCL_STEPS)*stepSize; }
   inline __device__ int sendOffset(int i) { return (sendStep[i]%NCCL_STEPS)*stepSize; }
   inline __device__ uint64_t* recvPtr(int i) { return recvBuff[i]+recvOffset(i); }
@@ -65,21 +84,39 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
   }
 
   inline __device__ void waitSend(int nbytes) {
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_WAIT_SEND_ENTRY)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_LL128_WAIT_SEND_ENTRY, nbytes, 0, clock64(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
     if (sendConnHeadPtr) {
       int spins = 0;
+      GPUPRINT(true, "tid=%d, blocked by proxy sendConnHeadCache=%llu(%p)+8 < sendConnHead=%llu(gpu curr) + 1", tid, sendConnHeadCache, sendConnHeadPtr, sendConnHead);
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
         sendConnHeadCache = *sendConnHeadPtr;
         if (checkAbort(spins, wid, 1)) break;
       }
       if (sendConnFifoPtr) {
         sendConnFifoPtr[sendStep[wid]%NCCL_STEPS] = nbytes;
+        GPUPRINT(true, "tid=%d, notify proxy sendConnFifoPtr[%llu(sendStep[wid(%llu)])]=%llu bytes", tid, sendStep[wid]%NCCL_STEPS, wid, nbytes);
       }
       sendConnHead += 1;
+      GPUPRINT(true, "tid=%d, move sendConnHead=%llu(gpu curr) after 1", tid, sendConnHead);
     }
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_WAIT_SEND_EXIT)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(NPKIT_EVENT_PRIM_LL128_WAIT_SEND_EXIT, nbytes, 0, clock64(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
   }
 
   inline __device__ void postRecv() {
-    if (recvConnHeadPtr) *recvConnHeadPtr = recvConnHead += 1;
+    if (recvConnHeadPtr) {
+      *recvConnHeadPtr = recvConnHead += 1;
+      GPUPRINT(true, "tid=%d, updates proxy head=recvConnHead(gpu curr)=%llu(%p) after +1", tid, recvConnHead, recvConnHeadPtr);
+    }
   }
   inline __device__ void postSend() {
     if (sendConnTailPtr) {
@@ -89,6 +126,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
       __threadfence();
 #endif
       *sendConnTailPtr = sendConnTail += 1;
+      GPUPRINT(true, "tid=%d, updates proxy tail=sendConnTail(gpu curr)=%llu(%p) after +1", tid, sendConnTail, sendConnTailPtr);
     }
   }
 
@@ -194,6 +232,14 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
       uint64_t flag = recvFlag(0);
       bool needReload;
       int spins = 0;
+
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+      int npkitWaitRecvSpins = 0;
+      if (tid == 0) {
+        npKitWaitRecvEntryTime = clock64();
+      }
+#endif
+
       do {
         needReload = false;
         #pragma unroll
@@ -201,8 +247,20 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
           load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
           needReload |= flagThread && (vr[u+1] != flag);
         }
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+        npkitWaitRecvSpins++;
+#endif
         needReload &= (0 == checkAbort(spins, 0, 0));
       } while (__any_sync(WARP_MASK, needReload));
+
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+      if (tid == 0) {
+        npKitWaitRecvExitTime = clock64();
+        npKitWaitRecvTotalTime += (npKitWaitRecvExitTime - npKitWaitRecvEntryTime) * (npkitWaitRecvSpins - 1) / npkitWaitRecvSpins;
+        npkitWaitRecvSpins = 0;
+      }
+#endif
+
 
       #pragma unroll
       for (int u=0; u<ELEMS_PER_THREAD; u+=2)
@@ -239,6 +297,14 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
         uint64_t* ptr = recvPtr(i)+ll128Offset;
         bool needReload;
         int spins = 0;
+
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+        int npkitWaitRecvSpins = 0;
+        if (tid == 0) {
+          npKitWaitRecvEntryTime = clock64();
+        }
+#endif
+
         do {
           needReload = false;
           #pragma unroll
@@ -246,8 +312,19 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
             load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
             needReload |= flagThread && (vr[u+1] != flag);
           }
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+          npkitWaitRecvSpins++;
+#endif
           needReload &= (0 == checkAbort(spins, i, 0));
         } while (__any_sync(WARP_MASK, needReload));
+
+#if defined(ENABLE_NPKIT) && (defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT) || defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME))
+        if (tid == 0) {
+          npKitWaitRecvExitTime = clock64();
+          npKitWaitRecvTotalTime += (npKitWaitRecvExitTime - npKitWaitRecvEntryTime) * (npkitWaitRecvSpins - 1) / npkitWaitRecvSpins;
+          npkitWaitRecvSpins = 0;
+        }
+#endif
 
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2)
@@ -293,7 +370,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
   static constexpr int WireWordPerSlice = WARP_SIZE*NCCL_LL128_SHMEM_ELEMS_PER_THREAD;
   static constexpr int DataEltPerSlice = (WireWordPerSlice - WireWordPerSlice/NCCL_LL128_LINEELEMS)*(sizeof(uint64_t)/sizeof(T));
 
-  template <int RECV, int SEND, int SrcBuf, int DstBuf>
+  template <int RECV, int SEND, int SrcBuf, int DstBuf, int ENTRY, int EXIT>
   __device__ __forceinline__ void GenericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
     constexpr int SRC = SrcBuf != -1 ? 1 : 0;
     constexpr int DST = DstBuf != -1 ? 1 : 0;
@@ -305,9 +382,28 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
 
     if (SEND) waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t));
     barrier();
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT)
+    if (tid == 0) {
+      npKitWaitRecvTotalTime = 0;
+      npKitWaitRecvDataProcessSize = nelem*sizeof(T);
+      NpKit::CollectGpuEvent(ENTRY,
+          npKitWaitRecvDataProcessSize, 0, clock64(), ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+    if (tid == 0) {
+      npKitWaitRecvTotalTime = 0;
+      npKitDataProcessEntryTime = clock64();
+    }
+#endif
+
     nelem -= DataEltPerSlice*warp;
     srcPtr += DataEltPerSlice*warp;
     dstPtr += DataEltPerSlice*warp;
+    GPUEXEC(barrier());
+    GPUPRINT(tid == 0, "genericop start: nelem=%dT", nelem);
     while (nelem > 0) {
       const int eltInSlice = min(nelem, DataEltPerSlice);
       uint64_t regs[NCCL_LL128_SHMEM_ELEMS_PER_THREAD];
@@ -322,6 +418,23 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
     }
 
     barrier();
+    GPUPRINT(tid == 0, "genericop end");
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+    if (tid == 0) {
+      npKitDataProcessExitTime = clock64();
+      npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime - npKitWaitRecvTotalTime;
+    }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_ENTRY) && defined(ENABLE_NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_EXIT)
+    if (tid == 0) {
+      NpKit::CollectGpuEvent(EXIT,
+          npKitWaitRecvDataProcessSize, npKitWaitRecvTotalTime, clock64(),
+          ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+    }
+#endif
+
     if (SEND) for (int i=0; i < MaxSend; i++) sendStep[i] += 1;
     if (SEND) postSend();
     if (RECV) for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
@@ -331,18 +444,21 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {
     recvBuff[i] = (uint64_t*)conn->buffs[NCCL_PROTO_LL128];
     recvStep[i] = conn->step;
+    GPUPRINT(tid==0, "recv recvBuff[i]=%p, recvStep[i]=%p", recvBuff[i], recvStep[i]);
     if (wid == i) recvConn = conn;
   }
   __device__ __forceinline__ void loadRecvSync() {
     if (tid >= nthreads-WARP_SIZE && wid < fan.nrecv()) {
       recvConnHeadPtr = recvConn->head;
       recvConnHead = recvConn->step;
+      GPUPRINT(true, "recv recvConnHeadPtr=%p recvConnHead=step=%llu", recvConnHeadPtr, recvConnHead);
     }
   }
 
   __device__ __forceinline__ void loadSendConn(struct ncclConnInfo* conn, int i) {
     sendBuff[i] = (uint64_t*)conn->buffs[NCCL_PROTO_LL128];
     sendStep[i] = conn->step;
+    GPUPRINT(tid==0, "send sendBuff[i]=%p sendStep[i]=%p", sendBuff[i], sendStep[i]);
     if (wid == i) sendConn = conn;
   }
   __device__ __forceinline__ void loadSendSync() {
@@ -351,11 +467,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p>:
       sendConnHeadCache = *sendConnHeadPtr;
       sendConnHead = sendConn->step;
       sendConnFifoPtr = sendConn->sizesFifo;
+      GPUPRINT(true, "send sendConnHeadPtr=%p sendConnHeadCache=%llu sendConnHead=%llu sendConnFifoPtr=%p", sendConnHeadPtr, sendConnHeadCache, sendConnHead, sendConnFifoPtr);
     }
     if (tid >= nthreads-WARP_SIZE && wid<fan.nsend()) {
       if (sendConn->sizesFifo) {
         sendConnTailPtr = sendConn->tail;
         sendConnTail = sendConn->step;
+        GPUPRINT(true, "send sendConnTailPtr=%p sendConnTail=step=%llu", sendConnTailPtr, sendConnTail);
       }
     }
   }
@@ -364,7 +482,7 @@ public:
   __device__ Primitives(
       const int tid, const int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,
-      uint8_t connIndexRecv=0, uint8_t connIndexSend=0
+      uint8_t connIndexRecv=0, uint8_t connIndexSend=0, uint8_t* transportIndex = nullptr
     ):
     redOp(redOpArg),
     tid(tid), nthreads(nthreads), wid(tid%WARP_SIZE), warp(tid/WARP_SIZE),
@@ -373,12 +491,19 @@ public:
     stepSize(ncclShmem.comm.buffSizes[NCCL_PROTO_LL128]/NCCL_STEPS/sizeof(uint64_t)) {
     auto *channel = &ncclShmem.channel;
     int nrecv=0, nsend=0;
+#ifdef DEBUG_BLOCK
+    if (tid == 0) printf("Simple connIndexRecv=%d, connIndexSend=%d\n", connIndexRecv, connIndexSend);
+#endif
     while (nrecv < MaxRecv && recvPeers[nrecv] >= 0) {
+      connIndexRecv = transportIndex ? connIndexRecv+transportIndex[nrecv]*NCCL_MAX_CONNS : connIndexRecv;
       loadRecvConn(&channel->peers[recvPeers[nrecv]]->recv[connIndexRecv], nrecv);
+      GPUPRINT(tid==0, "recv tid=%d, peer=%d, nrecv=%d, connIndexRecv=%d", tid, recvPeers[nrecv], nrecv+1, connIndexRecv);
       nrecv++;
     }
     while (nsend < MaxSend && sendPeers[nsend] >= 0) {
+      connIndexSend = transportIndex ? connIndexSend+transportIndex[MaxRecv+nsend]*NCCL_MAX_CONNS : connIndexSend;
       loadSendConn(&channel->peers[sendPeers[nsend]]->send[connIndexSend], nsend);
+      GPUPRINT(tid==0, "send tid=%d, peer=%d, nsend=%d, connIndexSend=%d", tid, sendPeers[nsend], nsend+1, connIndexSend);
       nsend++;
     }
     this->fan = Fan(nrecv, nsend);
@@ -408,27 +533,27 @@ public:
   }
 
   __device__ void send(intptr_t inpIx, int eltN) {
-    return GenericOp<0, 1, Input, -1>(inpIx, -1, eltN, false);
+    return GenericOp<0, 1, Input, -1, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_send_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_send_EXIT>(inpIx, -1, eltN, false);
   }
   __device__ void sendFromOutput(intptr_t outIx, int eltN) {
-    return GenericOp<0, 1, Output, -1>(outIx, -1, eltN, false);
+    return GenericOp<0, 1, Output, -1, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_sendFromOutput_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_sendFromOutput_EXIT>(outIx, -1, eltN, false);
   }
   __device__ void recv(intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 0, -1, Output>(-1, outIx, eltN, postOp);
+    return GenericOp<1, 0, -1, Output, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recv_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recv_EXIT>(-1, outIx, eltN, postOp);
   }
   __device__ void recvReduceSend(intptr_t inpIx, int eltN) {
-    return GenericOp<1, 1, Input, -1>(inpIx, -1, eltN, false);
+    return GenericOp<1, 1, Input, -1, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceSend_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceSend_EXIT>(inpIx, -1, eltN, false);
   }
   __device__ void recvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
+    return GenericOp<1, 0, Input, Output, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceCopy_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceCopy_EXIT>(inpIx, outIx, eltN, postOp);
   }
   __device__ void copySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    return GenericOp<0, 1, Input, Output, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_copySend_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_copySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
   __device__ void recvCopySend(intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 1, -1, Output>(-1, outIx, eltN, postOp);
+    return GenericOp<1, 1, -1, Output, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvCopySend_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvCopySend_EXIT>(-1, outIx, eltN, postOp);
   }
   __device__ void recvReduceCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    return GenericOp<1, 1, Input, Output, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceCopySend_ENTRY, NPKIT_EVENT_PRIM_LL128_DATA_PROCESS_FOR_recvReduceCopySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
 };

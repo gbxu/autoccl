@@ -36,7 +36,7 @@ struct ncclDevRedOpFull {
 /* Declare all collective operations */
 #define DECL5(func, algo, proto, devredop, type) \
   extern __device__ void NCCL_FUNC_NAME(func, algo, proto, devredop, type)(); \
-  extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead); \
+  extern __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)(struct ncclDevComm* comm, ChannelMask channelMasks, struct ncclWork* workHead); \
 
 #define SINGLE_ARG(...) __VA_ARGS__
 #define CONCAT(a,b) a##b
@@ -113,10 +113,16 @@ extern __device__ void NCCL_ONERANK_REDUCE_NAME(PreMulSum, double)();
 // CHUNKSIZE must be a multiple of SLICESIZE
 #define ALLREDUCE_SLICESTEPS (NCCL_STEPS/4)
 #define ALLREDUCE_CHUNKSTEPS (NCCL_STEPS/2)
+static_assert(ALLREDUCE_SLICESTEPS <= ALLREDUCE_CHUNKSTEPS);
+static_assert(ALLREDUCE_CHUNKSTEPS <= NCCL_STEPS/2);
 #define ALLGATHER_SLICESTEPS (NCCL_STEPS/4)
 #define ALLGATHER_CHUNKSTEPS (NCCL_STEPS/2)
+static_assert(ALLGATHER_SLICESTEPS <= ALLGATHER_CHUNKSTEPS);
+static_assert(ALLGATHER_CHUNKSTEPS <= NCCL_STEPS/2);
 #define REDUCESCATTER_SLICESTEPS (NCCL_STEPS/4)
 #define REDUCESCATTER_CHUNKSTEPS (NCCL_STEPS/2)
+static_assert(REDUCESCATTER_SLICESTEPS <= REDUCESCATTER_CHUNKSTEPS);
+static_assert(REDUCESCATTER_CHUNKSTEPS <= NCCL_STEPS/2);
 #define BROADCAST_SLICESTEPS 1
 #define BROADCAST_CHUNKSTEPS 1
 #define REDUCE_SLICESTEPS 1

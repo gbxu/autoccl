@@ -307,6 +307,7 @@ static ncclResult_t connectNvls(struct ncclComm* comm, int* nvlsHeads, struct nc
   return ncclSuccess;
 }
 
+// TODO(anonymous): honor
 // Legacy naming
 NCCL_PARAM(MinNrings, "MIN_NRINGS", -2);
 NCCL_PARAM(MaxNrings, "MAX_NRINGS", -2);
@@ -354,10 +355,11 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   int nranks = comm->nRanks;
   int nNodes = comm->nNodes;
   int nChannels = comm->nChannels;
+  int nChannelsBasedonTopo = comm->nChannels;
   NCCLCHECK(ncclCalloc(&ringRecv, nNodes*MAXCHANNELS));
   NCCLCHECK(ncclCalloc(&ringSend, nNodes*MAXCHANNELS));
-  NCCLCHECK(ncclCalloc(&ringPrev, nranks*MAXCHANNELS));
-  NCCLCHECK(ncclCalloc(&ringNext, nranks*MAXCHANNELS));
+  NCCLCHECK(ncclCalloc(&ringPrev, nranks*TUNER_MAXCHANNELS));
+  NCCLCHECK(ncclCalloc(&ringNext, nranks*TUNER_MAXCHANNELS));
   NCCLCHECK(ncclCalloc(&treeToParent, nNodes*MAXCHANNELS));
   NCCLCHECK(ncclCalloc(&treeToChild0, nNodes*MAXCHANNELS));
   NCCLCHECK(ncclCalloc(&treeToChild1, nNodes*MAXCHANNELS));
@@ -411,14 +413,21 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   if (comm->sharedRes->owner != comm) {
     /* child comm #channels cannot exceed top parent #channels. */
     nChannels = comm->nChannels = std::min(std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs), comm->sharedRes->tpNChannels);
-    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::min(std::max(ncclMinNchannels(), comm->config.minCTAs), comm->sharedRes->tpNChannels), ringPrev, ringNext);
+    // nChannels = comm->nChannels = copyChannels(comm, nChannels, std::min(std::max(ncclMinNchannels(), comm->config.minCTAs), comm->sharedRes->tpNChannels), ringPrev, ringNext);
+    int originalCopy = std::min(std::max(ncclMinNchannels(), comm->config.minCTAs), comm->sharedRes->tpNChannels);
+    nChannels = comm->nChannels = copyChannels(comm, nChannels, originalCopy, ringPrev, ringNext);
+    copyChannels(comm, nChannels, (*comm->tunerEnvs)["tuner_nChannels"], ringPrev, ringNext);
   } else {
     nChannels = comm->nChannels = std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs);
-    nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
+    // nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
+    int originalCopy = std::max(ncclMinNchannels(), comm->config.minCTAs);
+    nChannels = comm->nChannels = copyChannels(comm, nChannels, originalCopy, ringPrev, ringNext);
+    copyChannels(comm, nChannels, (*comm->tunerEnvs)["tuner_nChannels"], ringPrev, ringNext);
   }
+  INFO(NCCL_INIT, "nChannelsBasedonTopo=%d, copy to: comm->nChannels=%d, tuner_nChannels=%d", nChannelsBasedonTopo, nChannels, (*comm->tunerEnvs)["tuner_nChannels"]);
 
   // Create rings array and check all is fine
-  NCCLCHECK(ncclBuildRings(nChannels, rings, comm->rank, comm->nRanks, ringPrev, ringNext));
+  NCCLCHECK(ncclBuildRings(std::max(nChannels, (*comm->tunerEnvs)["tuner_nChannels"]), rings, comm->rank, comm->nRanks, ringPrev, ringNext));
 
   free(ringRecv);
   free(ringSend);

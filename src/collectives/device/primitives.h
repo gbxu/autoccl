@@ -11,6 +11,7 @@
 #include "reduce_kernel.h" // for reduction funcs
 #include "common_kernel.h"
 #include "common.h"
+#include "npkit/npkit_event.h"
 
 #define NCCL_SPINS_BEFORE_CHECK_ABORT 1000000
 
@@ -44,6 +45,8 @@ struct ProtoSimple {
 
 struct ProtoLL {
   static constexpr int Id = NCCL_PROTO_LL;
+  static constexpr int SlicePerChunk = 1;
+  static constexpr int StepPerSlice = 1;
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {
@@ -59,6 +62,8 @@ struct ProtoLL {
 
 struct ProtoLL128 {
   static constexpr int Id = NCCL_PROTO_LL128;
+  static constexpr int SlicePerChunk = 1;
+  static constexpr int StepPerSlice = 1;
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {

@@ -171,6 +171,14 @@ static ncclResult_t doLaunches(struct ncclComm* head) {
           CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), result, failure);
           NCCLCHECKGOTO(ncclLaunchFinish(comm), result, failure);
         }
+        if (comm->tuner != NULL) {
+          comm->tuner->stopProfiling(comm->commHash);
+          TRACE(NCCL_COLL, "profiling: commHash=%llu, coll=%d, nBytes per rank=%ld, algorithm=%d, protocol=%d, isCopyEngineNotSmCopy=%d, p2pLevel=%d, nChannels=%d, nThreads=%d, wireChunkSize=%ld, iteration=%d, lastIterEffectiveChunksize=%d, native=%d", 
+            comm->tasks.workload.commHash, comm->tasks.workload.collType, comm->tasks.workload.nBytes, 
+            comm->tasks.candidate.algorithm, comm->tasks.candidate.protocol, comm->tasks.candidate.isCopyEngineNotSmCopy, comm->tasks.candidate.p2pLevel, 
+            comm->tasks.candidate.nChannels, comm->tasks.candidate.nThreads, comm->tasks.candidate.wireChunksize, comm->tasks.candidate.iteration, comm->tasks.candidate.lastIterEffectiveChunksize, 
+            comm->tasks.candidate.native);
+        }
         comm = next;
       } while (comm != cliqueNextHead);
       if (!moreRounds) break;
@@ -194,8 +202,10 @@ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclComm** g
     for (int i = 0; i < comm->nRanks; i++) {
       comm->tasks.peers[i].sendSeen = false;
       comm->tasks.peers[i].recvSeen = false;
-      comm->connectSend[i] = 0UL;
-      comm->connectRecv[i] = 0UL;
+      comm->tasks.backup.peers[i].sendSeen = false;
+      comm->tasks.backup.peers[i].recvSeen = false;
+      memset(comm->connectSend[i], 0, TUNER_MAXCHANNELS * sizeof(bool));
+      memset(comm->connectRecv[i], 0, TUNER_MAXCHANNELS * sizeof(bool));
     }
     comm->unlaunchedPlansHead = nullptr;
     // Reclaim abandoned kernel plan memory. Note ncclWork structs were already
@@ -205,7 +215,7 @@ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclComm** g
       // Persistent plans will be reclaimed via the callbackQueue when the
       // graph drops its UserObject reference.
       if (!plan->persistent) {
-        for (int c = 0; c < MAXCHANNELS; c++) {
+        for (int c = 0; c < TUNER_MAXCHANNELS; c++) {
           while (!ncclIntruQueueEmpty(&plan->channels[c].proxyOpQueue)) {
             struct ncclProxyOp* pxop = ncclIntruQueueDequeue(&plan->channels[c].proxyOpQueue);
             ncclMemoryPoolFree(&comm->memPool_ncclProxyOp, pxop);
@@ -217,12 +227,18 @@ static void groupCleanup(struct ncclComm** groupCommHeadPtr, struct ncclComm** g
     // Reset comm->tasks to empty.
     comm->tasks.nTasksColl = 0;
     comm->tasks.nTasksP2p = 0;
+    comm->tasks.backup.nTasksColl = 0;
+    comm->tasks.backup.nTasksP2p = 0;
     comm->tasks.streams = nullptr;
     ncclIntruQueueConstruct(&comm->tasks.collQueue);
     comm->tasks.collBytesTotal = 0;
+    ncclIntruQueueConstruct(&comm->tasks.backup.collQueue);
+    comm->tasks.backup.collBytesTotal = 0;
     for (int i = 0; i < comm->nRanks; i++) {
       ncclIntruQueueConstruct(&comm->tasks.peers[i].sendQueue);
       ncclIntruQueueConstruct(&comm->tasks.peers[i].recvQueue);
+      ncclIntruQueueConstruct(&comm->tasks.backup.peers[i].sendQueue);
+      ncclIntruQueueConstruct(&comm->tasks.backup.peers[i].recvQueue);
     }
 
     if (!comm->config.blocking)

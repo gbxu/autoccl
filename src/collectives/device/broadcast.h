@@ -16,8 +16,20 @@ namespace {
     const int bid = args->bid;
     const int nChannels = args->nChannels;
     ncclRing *ring = &ncclShmem.channel.ring;
-    const ssize_t chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? BROADCAST_CHUNKSTEPS : 1));
-    const ssize_t minChunkSizeLL128 = int(nthreads*(Proto::calcBytePerGrain()/sizeof(T)));
+    ssize_t chunkSize;
+    if (args->native) {
+      chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? BROADCAST_CHUNKSTEPS : 1));
+    } else {
+      chunkSize = args->effectiveChunkSize; // effective chunksize
+    }
+    ssize_t minChunkSize;
+    if (Proto::Id == NCCL_PROTO_LL)
+      minChunkSize = nthreads*(Proto::calcBytePerGrain()/sizeof(T));
+    if (Proto::Id == NCCL_PROTO_LL128) {
+      // We should not need the final /2 but it makes performance much, much smoother. Might be a bug somewhere.
+      minChunkSize = nthreads*(Proto::calcBytePerGrain()/sizeof(T)); // minChunkSizeLL128
+    }
+
     const ssize_t loopSize = nChannels*chunkSize;
     const ssize_t size = args->count;
     const int rank = ring->userRanks[0];
@@ -27,7 +39,7 @@ namespace {
     T *inputBuf = (T*)args->sendbuff;
     T *outputBuf = (T*)args->recvbuff;
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, args->redOpArg);
+      prims(tid, nthreads, &ring->prev, &ring->next, inputBuf, outputBuf, args->redOpArg, 0, 0, 0, args->transportIndex);
 
     for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
       ssize_t realChunkSize;
@@ -35,10 +47,16 @@ namespace {
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels));
         realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
       }
-      else if (Proto::Id == NCCL_PROTO_LL)
-        realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
-      else if (Proto::Id == NCCL_PROTO_LL128)
-        realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*minChunkSizeLL128)*minChunkSizeLL128);
+      else if (Proto::Id == NCCL_PROTO_LL) {
+        if (args->native) {
+          realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
+        } else {
+          realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize);
+        }
+      }
+      else if (Proto::Id == NCCL_PROTO_LL128) {
+        realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize);
+      }
       realChunkSize = int(realChunkSize);
 
       ssize_t offset = gridOffset + int(bid*realChunkSize);

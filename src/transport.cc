@@ -12,6 +12,9 @@
 
 struct ncclTransport* ncclTransports[NTRANSPORTS] = {
   &p2pTransport,
+#if NTRANSPORTS == 5
+  &p2pTransportCE,
+#endif
   &shmTransport,
   &netTransport,
   &collNetTransport
@@ -25,13 +28,77 @@ static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph*
                                                   comm->channels[channelId].peers[peer]->recv + connIndex;
   for (int t=0; t<NTRANSPORTS; t++) {
     struct ncclTransport *transport = ncclTransports[t];
+    if (transport == &p2pTransportCE) continue;
     struct ncclTransportComm* transportComm = type == 1 ? &transport->send : &transport->recv;
     int ret = 0;
+    int p2pRet = 1;
+    int currP2pLevel;
+    if (transport == &p2pTransport) {
+      // Check topology / p2p level.
+      NCCLCHECK(ncclTopoCheckP2p(comm->topo, myInfo->busId, peerInfo->busId, &p2pRet, NULL, NULL, (*comm->tunerEnvs)["tuner_extraP2PCE_disable"] && (*comm->tunerEnvs)["tuner_extraSHM_disable"], (*comm->tunerEnvs)["tuner_p2pLevel"], &currP2pLevel));
+    }
     NCCLCHECK(transport->canConnect(&ret, comm->topo, graph, myInfo, peerInfo));
-    if (ret) {
+    if (ret && p2pRet) {
       connector->transportComm = transportComm;
+      // net or shm will use connect+0 if not p2pSupport
       NCCLCHECK(transportComm->setup(comm, graph, myInfo, peerInfo, connect, connector, channelId, connIndex));
       if (transportType) *transportType = t;
+      if (transport==&p2pTransport) {
+        comm->channels[channelId].peers[peer]->p2pLevel = currP2pLevel; // keep for tuner
+        comm->channels[channelId].peers[peer]->transportMask = 0b00000001;
+        for (int i=1; i<TRANSPORT_NUM; ++i) {
+          // for p2p_ce and shm
+          struct ncclConnector* connector_extra = (type == 1) ? comm->channels[channelId].peers[peer]->send + connIndex + NCCL_MAX_CONNS*i:
+                                                    comm->channels[channelId].peers[peer]->recv + connIndex + NCCL_MAX_CONNS*i;
+          connector_extra->transportComm = NULL;
+          struct ncclTransport *transport_extra = NULL;
+          if (comm->tuner == NULL) {
+            continue;
+          }
+          if (i == 1) {
+            // p2p_ce
+            transport_extra = ncclTransports[TRANSPORT_P2P_CE];
+          } else if (i == 2) {
+            // shm
+            transport_extra = ncclTransports[TRANSPORT_SHM];
+          } else {
+            return ncclInternalError;
+          }
+          if ((*comm->tunerEnvs)["tuner_extraP2PCE_disable"] && transport_extra == &p2pTransportCE) continue;
+          if ((*comm->tunerEnvs)["tuner_extraSHM_disable"] && transport_extra == &shmTransport) continue;
+          int p2pCERet = 1;
+          if (transport == &p2pTransportCE) {
+            // Check topology / p2p level.
+            int intermediateRank;
+            NCCLCHECK(ncclTopoCheckP2p(comm->topo, myInfo->busId, peerInfo->busId, &p2pCERet, NULL, &intermediateRank, false, (*comm->tunerEnvs)["tuner_p2pLevel"], NULL));
+            if (intermediateRank != -1) {
+              p2pCERet = 0;
+            }
+          }
+          NCCLCHECK(transport_extra->canConnect(&ret, comm->topo, graph, myInfo, peerInfo));
+          if (ret && p2pCERet) {
+            connector_extra->transportComm = type == 1 ? &transport_extra->send : &transport_extra->recv;
+            NCCLCHECK(connector_extra->transportComm->setup(comm, graph, myInfo, peerInfo, connect+i, connector_extra, channelId, connIndex));
+            comm->channels[channelId].peers[peer]->transportMask |= (1 << i);
+            if (transport_extra == &p2pTransportCE) {
+              (*comm->tunerEnvs)["tuner_extraP2PCE"] = 1;
+            }
+            if (transport_extra == &shmTransport) {
+              (*comm->tunerEnvs)["tuner_extraSHM"] = 1;
+            }
+            TRACE(NCCL_INIT, "%s:%d channel=%d peer=%d %s connIndex=%d transportComm=%p(extra) transport=%d", __FILE__, __LINE__, channelId, peer, graph ? (type ? "send(coll)" : "recv(coll)") : (type ? "send" : "recv"), connIndex+NCCL_MAX_CONNS*i, connector_extra->transportComm, i);
+          }
+        }
+      } else if (transport==&shmTransport || transport==&netTransport) {
+        // shared memory or network
+        comm->channels[channelId].peers[peer]->p2pLevel = PATH_DIS; // No p2p
+        comm->channels[channelId].peers[peer]->transportMask |= 1 << t;
+      } else if (transport==&collNetTransport) {
+        WARN("Use collNetTransport for rank %d[%lx] -> rank %d[%lx]", myInfo->rank, myInfo->busId, peerInfo->rank, peerInfo->busId);
+        comm->channels[channelId].peers[peer]->p2pLevel = PATH_DIS; // No p2p
+        comm->channels[channelId].peers[peer]->transportMask |= 1 << t;
+      }
+      TRACE(NCCL_INIT, "%s:%d channel=%d peer=%d %s connIndex=%d transportComm=%p(curr) transport=%d transportMask=%x", __FILE__, __LINE__, channelId, peer, graph ? (type ? "send(coll)" : "recv(coll)") : (type ? "send" : "recv"), connIndex, connector->transportComm, t, comm->channels[channelId].peers[peer]->transportMask);
       return ncclSuccess;
     }
   }
@@ -42,16 +109,15 @@ static ncclResult_t selectTransport(struct ncclComm* comm, struct ncclTopoGraph*
 ncclResult_t ncclTransportP2pConnect(struct ncclComm* comm, int channelId, int nrecv, int* peerRecv, int nsend, int* peerSend, int connIndex) {
   TRACE(NCCL_INIT, "nsend %d nrecv %d", nsend, nrecv);
   struct ncclChannel* channel = &comm->channels[channelId];
-  uint64_t mask = 1UL << channel->id;
   for (int i=0; i<nrecv; i++) {
     int peer = peerRecv[i];
     if (peer == -1 || peer >= comm->nRanks || peer == comm->rank || channel->peers[peer]->recv[connIndex].connected) continue;
-    comm->connectRecv[peer] |= mask;
+    comm->connectRecv[peer][channel->id] = true;
   }
   for (int i=0; i<nsend; i++) {
     int peer = peerSend[i];
     if (peer == -1 || peer >= comm->nRanks || peer == comm->rank || channel->peers[peer]->send[connIndex].connected) continue;
-    comm->connectSend[peer] |= mask;
+    comm->connectSend[peer][channel->id] = true;
   }
   return ncclSuccess;
 }
@@ -79,49 +145,53 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     int bootstrapTag = (i<<8) + (graph ? graph->id+1 : 0);
     int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
     int sendPeer = (comm->rank + i) % comm->nRanks;
-    uint64_t recvMask = comm->connectRecv[recvPeer];
-    uint64_t sendMask = comm->connectSend[sendPeer];
 
     // Data[i] contains all ncclConnect information for all send and receive connections with a given send and recv peer
     // This data is packed in the array based on the number of sendChannels and recvChannels connected with these peers
     // The first N entries contain recvData, connection information for recv connections
     // The next M entries contain sendData, connection information for send connections
     // It's not guaranteed that each entry of data has the same number of total or send/recv specific connections
-    data[i] = (ncclConnect*) malloc(sizeof(ncclConnect) * 2*MAXCHANNELS);
+    // 2 for send and recv
+    // TUNER_MAXCHANNELS for channels
+    // TRANSPORT_NUM for extra intra-node gpu transport: P2PCE(Copy Engine not SM copy), SHM
+    data[i] = (ncclConnect*) malloc(sizeof(ncclConnect) * 2 * TUNER_MAXCHANNELS * TRANSPORT_NUM);
     recvData[i] = data[i];
     int sendChannels = 0, recvChannels = 0;
     int type;
     TIME_START(0);
-    for (int c=0; c<MAXCHANNELS; c++) {
-      if (recvMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[i]+recvChannels++, c, recvPeer, connIndex, &type), ret, fail);
+    for (int c=0; c<TUNER_MAXCHANNELS; c++) {
+      if (comm->connectRecv[recvPeer][c]) {
+        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[i]+recvChannels*TRANSPORT_NUM, c, recvPeer, connIndex, &type), ret, fail);
+        recvChannels += 1;
         if (type > highestType) highestType = type;
       }
     }
     TIME_STOP(0);
     TIME_START(1);
-    sendData[i] = recvData[i]+recvChannels;
-    for (int c=0; c<MAXCHANNELS; c++) {
-      if (sendMask & (1UL<<c)) {
-        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[i]+sendChannels++, c, sendPeer, connIndex, &type), ret, fail);
+    sendData[i] = recvData[i]+recvChannels*TRANSPORT_NUM;
+    for (int c=0; c<TUNER_MAXCHANNELS; c++) {
+      if (comm->connectSend[sendPeer][c]) {
+        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[i]+sendChannels*TRANSPORT_NUM, c, sendPeer, connIndex, &type), ret, fail);
+        sendChannels += 1;
         if (type > highestType) highestType = type;
       }
     }
     TIME_STOP(1);
 
     TIME_START(2);
+    TRACE(NCCL_INIT, "%s:%d recvChannels=%d for recvPeer=%d, sendChannels=%d for sendPeer=%d", __FILE__, __LINE__, recvChannels, recvPeer, sendChannels, sendPeer);
     if (sendPeer == recvPeer) {
       if (recvChannels+sendChannels) {
-        NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, recvPeer, bootstrapTag, data[i], sizeof(struct ncclConnect)*(recvChannels+sendChannels)), ret, fail);
-        NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, recvPeer, bootstrapTag, data[i], sizeof(struct ncclConnect)*(recvChannels+sendChannels)), ret, fail);
+        NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, recvPeer, bootstrapTag, data[i], sizeof(struct ncclConnect)*(recvChannels+sendChannels)*TRANSPORT_NUM), ret, fail);
+        NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, recvPeer, bootstrapTag, data[i], sizeof(struct ncclConnect)*(recvChannels+sendChannels)*TRANSPORT_NUM), ret, fail);
         sendData[i] = data[i];
-        recvData[i] = data[i]+sendChannels;
+        recvData[i] = data[i]+sendChannels*TRANSPORT_NUM;
       }
     } else {
-      if (recvChannels) NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, recvPeer, bootstrapTag, recvData[i], sizeof(struct ncclConnect)*recvChannels), ret, fail);
-      if (sendChannels) NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, sendPeer, bootstrapTag, sendData[i], sizeof(struct ncclConnect)*sendChannels), ret, fail);
-      if (sendChannels) NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, sendPeer, bootstrapTag, sendData[i], sizeof(struct ncclConnect)*sendChannels), ret, fail);
-      if (recvChannels) NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, recvPeer, bootstrapTag, recvData[i], sizeof(struct ncclConnect)*recvChannels), ret, fail);
+      if (recvChannels) NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, recvPeer, bootstrapTag, recvData[i], sizeof(struct ncclConnect)*recvChannels*TRANSPORT_NUM), ret, fail);
+      if (sendChannels) NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, sendPeer, bootstrapTag, sendData[i], sizeof(struct ncclConnect)*sendChannels*TRANSPORT_NUM), ret, fail);
+      if (sendChannels) NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, sendPeer, bootstrapTag, sendData[i], sizeof(struct ncclConnect)*sendChannels*TRANSPORT_NUM), ret, fail);
+      if (recvChannels) NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, recvPeer, bootstrapTag, recvData[i], sizeof(struct ncclConnect)*recvChannels*TRANSPORT_NUM), ret, fail);
     }
     TIME_STOP(2);
   }
@@ -134,26 +204,31 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
     for (int i=1; i<comm->nRanks; i++) {
       int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
       int sendPeer = (comm->rank + i) % comm->nRanks;
-      uint64_t recvMask = comm->connectRecv[recvPeer];
-      uint64_t sendMask = comm->connectSend[sendPeer];
 
       int sendDataOffset = 0;
       int recvDataOffset = 0;
-      for (int c=0; c<MAXCHANNELS; c++) {
+      for (int c=0; c<TUNER_MAXCHANNELS; c++) {
           TIME_START(3);
-          if (sendMask & (1UL<<c)) {
-            struct ncclConnector* conn = comm->channels[c].peers[sendPeer]->send + connIndex;
-            // This connector hasn't completed connection yet
-            if (conn->connected == 0) {
-              NCCLCHECKGOTO(conn->transportComm->connect(comm, sendData[i] + sendDataOffset++, 1, comm->rank, conn), ret, fail);
-              if (ret == ncclSuccess) {
-                struct ncclDevChannelPeer* addr;
-                conn->connected = 1;
-                /* comm->channels[c].devPeers[sendPeer]->send[connIndex] is a device memory access. */
-                CUDACHECKGOTO(cudaMemcpyAsync(&addr, &comm->channels[c].devPeers[sendPeer], sizeof(struct ncclDevChannelPeer*), cudaMemcpyDeviceToHost, comm->sharedRes->hostStream.cudaStream), ret, fail);
-                CUDACHECKGOTO(cudaMemcpyAsync(&addr->send[connIndex], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
-              } else if (ret == ncclInProgress) {
-                allChannelsConnected = false;
+          if (comm->connectSend[sendPeer][c]) {
+            for (int extra_index=0; extra_index<TRANSPORT_NUM; extra_index++) {
+              struct ncclConnector* conn = comm->channels[c].peers[sendPeer]->send + connIndex + NCCL_MAX_CONNS*extra_index;
+              // This connector hasn't completed connection yet
+              if (conn->connected == 0) {
+                if (conn->transportComm != NULL) {
+                  NCCLCHECKGOTO(conn->transportComm->connect(comm, sendData[i] + sendDataOffset, 1, comm->rank, conn), ret, fail);
+                  if (ret == ncclSuccess) {
+                    TRACE(NCCL_INIT, "%s:%d channel=%d Peer=%d send connIndex=%d transportComm=%p connected", __FILE__, __LINE__, c, sendPeer, connIndex + NCCL_MAX_CONNS*extra_index, conn->transportComm);
+                    struct ncclDevChannelPeer* addr;
+                    conn->connected = 1;
+                    /* comm->channels[c].devPeers[sendPeer]->send[connIndex] is a device memory access. */
+                    // CUDACHECKGOTO(cudaMemcpy(&addr, &comm->channels[c].devPeers[sendPeer], sizeof(struct ncclDevChannelPeer*), cudaMemcpyDeviceToHost), ret, fail);
+                    // CUDACHECKGOTO(cudaMemcpyAsync(&addr->send[connIndex + NCCL_MAX_CONNS*extra_index], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
+                    CUDACHECKGOTO(cudaMemcpyAsync(&comm->channels[c].devPeersHostPtr[sendPeer]->send[connIndex + NCCL_MAX_CONNS*extra_index], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
+                  } else if (ret == ncclInProgress) {
+                    allChannelsConnected = false;
+                  }
+                }
+                sendDataOffset += 1;
               }
             }
           }
@@ -161,19 +236,26 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
 
           // Start with recv channels
           TIME_START(4);
-          if (recvMask & (1UL<<c)) {
-            struct ncclConnector* conn = comm->channels[c].peers[recvPeer]->recv + connIndex;
-            // This connector hasn't completed connection yet
-            if (conn->connected == 0) {
-              NCCLCHECKGOTO(conn->transportComm->connect(comm, recvData[i] + recvDataOffset++, 1, comm->rank, conn), ret, fail);
-              if (ret == ncclSuccess) {
-                struct ncclDevChannelPeer* addr;
-                conn->connected = 1;
-                /* comm->channels[c].devPeers[recvPeer]->recv[connIndex] is a device memory access. */
-                CUDACHECKGOTO(cudaMemcpyAsync(&addr, &comm->channels[c].devPeers[recvPeer], sizeof(struct ncclDevChannelPeer*), cudaMemcpyDeviceToHost, comm->sharedRes->hostStream.cudaStream), ret, fail);
-                CUDACHECKGOTO(cudaMemcpyAsync(&addr->recv[connIndex], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
-              } else if (ret == ncclInProgress) {
-                allChannelsConnected = false;
+          if (comm->connectRecv[recvPeer][c]) {
+            for (int extra_index=0; extra_index<TRANSPORT_NUM; extra_index++) {
+              struct ncclConnector* conn = comm->channels[c].peers[recvPeer]->recv + connIndex + NCCL_MAX_CONNS*extra_index;
+              // This connector hasn't completed connection yet
+              if (conn->connected == 0) {
+                if (conn->transportComm != NULL) {
+                  NCCLCHECKGOTO(conn->transportComm->connect(comm, recvData[i] + recvDataOffset, 1, comm->rank, conn), ret, fail);
+                  if (ret == ncclSuccess) {
+                    TRACE(NCCL_INIT, "%s:%d channel=%d Peer=%d recv connIndex=%d transportComm=%p connected", __FILE__, __LINE__, c, recvPeer, connIndex + NCCL_MAX_CONNS*extra_index, conn->transportComm);
+                    struct ncclDevChannelPeer* addr;
+                    conn->connected = 1;
+                    /* comm->channels[c].devPeers[recvPeer]->recv[connIndex] is a device memory access. */
+                    // CUDACHECKGOTO(cudaMemcpy(&addr, &comm->channels[c].devPeers[recvPeer], sizeof(struct ncclDevChannelPeer*), cudaMemcpyDeviceToHost), ret, fail);
+                    // CUDACHECKGOTO(cudaMemcpyAsync(&addr->recv[connIndex+NCCL_MAX_CONNS*extra_index], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
+                    CUDACHECKGOTO(cudaMemcpyAsync(&comm->channels[c].devPeersHostPtr[recvPeer]->recv[connIndex + NCCL_MAX_CONNS*extra_index], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, comm->sharedRes->hostStream.cudaStream), ret, fail);
+                  } else if (ret == ncclInProgress) {
+                    allChannelsConnected = false;
+                  }
+                }
+                recvDataOffset += 1;
               }
             }
           }
@@ -186,7 +268,8 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
   for (int i=1; i<comm->nRanks; i++) {
     int recvPeer = (comm->rank - i + comm->nRanks) % comm->nRanks;
     int sendPeer = (comm->rank + i) % comm->nRanks;
-    comm->connectRecv[recvPeer] = comm->connectSend[sendPeer] = 0UL;
+    memset(comm->connectRecv[recvPeer], 0, TUNER_MAXCHANNELS * sizeof(bool));
+    memset(comm->connectSend[sendPeer], 0, TUNER_MAXCHANNELS * sizeof(bool));
     free(data[i]);
   }
 
@@ -315,12 +398,12 @@ ncclResult_t ncclTransportCollNetFree(struct ncclComm* comm) {
     struct ncclChannelPeer* peer = channel->peers[comm->nRanks];
     if (peer) {
       if (ncclAtomicRefCountDecrement(&peer->refCount) == 0) {
-        for (int b=0; b<NCCL_MAX_CONNS; b++) {
+        for (int b=0; b<NCCL_MAX_CONNS*TRANSPORT_NUM; b++) {
           struct ncclConnector* send = peer->send + b;
           if (send->transportResources && send->transportComm) NCCLCHECK(send->transportComm->free(send));
           send->transportResources = NULL; // avoid double free
         }
-        for (int b=0; b<NCCL_MAX_CONNS; b++) {
+        for (int b=0; b<NCCL_MAX_CONNS*TRANSPORT_NUM; b++) {
           struct ncclConnector* recv = peer->recv + b;
           if (recv->transportResources && recv->transportComm) NCCLCHECK(recv->transportComm->free(recv));
           recv->transportResources = NULL; // avoid double free

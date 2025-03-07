@@ -16,6 +16,10 @@
 #include "enqueue.h"
 #include "graph.h"
 #include "argcheck.h"
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
+#include "tuner.h"
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -36,7 +40,7 @@
 
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
 const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree" };
-const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
+const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple"};
 
 NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
 
@@ -173,6 +177,7 @@ static ncclResult_t commFree(ncclComm_t comm) {
   if (comm == NULL)
     return ncclSuccess;
 
+  delete comm->tunerEnvs;
   /* in commReclaim, we have guaranteed only last rank which calls ncclCommDestroy() will
    * free all intra-process communicators; therefore, we only need to focus on local
    * resource cleanup in commFree(). */
@@ -199,12 +204,12 @@ static ncclResult_t commFree(ncclComm_t comm) {
   if (comm->bootstrap)
     NCCLCHECK(bootstrapClose(comm->bootstrap));
 
-  for (int channel=0; channel<MAXCHANNELS; channel++)
+  for (int channel=0; channel<TUNER_MAXCHANNELS; channel++)
     NCCLCHECK(freeChannel(comm->channels+channel, comm->nRanks, 1, comm->localRanks));
 
   if (comm->sharedRes) {
     if (ncclAtomicRefCountDecrement(&comm->sharedRes->refCount) == 0) {
-      for (int c=0; c<MAXCHANNELS; c++) {
+      for (int c=0; c<TUNER_MAXCHANNELS; c++) {
         if (comm->sharedRes->peers[c]) free(comm->sharedRes->peers[c]);
         if (comm->sharedRes->devPeers[c]) ncclCudaFree(comm->sharedRes->devPeers[c]);
       }
@@ -343,13 +348,13 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->preconnectNext = reinterpret_cast<struct ncclComm*>(0x1);
   comm->channelSize = ncclParamAggChannelSize();
 
-  static_assert(MAXCHANNELS <= sizeof(*comm->connectSend)*8, "comm->connectSend must have enough bits for all channels");
-  static_assert(MAXCHANNELS <= sizeof(*comm->connectRecv)*8, "comm->connectRecv must have enough bits for all channels");
+  static_assert(sizeof(*comm->connectSend) == TUNER_MAXCHANNELS * sizeof(bool), "comm->connectSend must have enough space for all channels of peers");
+  static_assert(sizeof(*comm->connectRecv) == TUNER_MAXCHANNELS * sizeof(bool), "comm->connectRecv must have enough space for all channels of peers");
   NCCLCHECK(ncclCalloc(&comm->connectSend, comm->nRanks));
   NCCLCHECK(ncclCalloc(&comm->connectRecv, comm->nRanks));
 
   // Mark channels as non initialized.
-  for (int c=0; c < MAXCHANNELS; c++) comm->channels[c].id = -1;
+  for (int c=0; c < TUNER_MAXCHANNELS; c++) comm->channels[c].id = -1;
 
   if (parent == NULL || !parent->config.splitShare) {
     struct ncclSharedResources* sharedRes = NULL;
@@ -415,12 +420,12 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   }
   tmpCommAndChans.comm.workFifoHeap = comm->devWorkFifoHeap;
 
-  NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->workFifoDone, MAXCHANNELS), ret, fail);
+  NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->workFifoDone, TUNER_MAXCHANNELS), ret, fail);
   ncclCommPushCudaHostFree(comm, comm->workFifoDone);
   comm->workFifoSent = 0;
   comm->workFifoAckdMin = 0;
 
-  for (int c=0; c < MAXCHANNELS; c++) {
+  for (int c=0; c < TUNER_MAXCHANNELS; c++) {
     tmpCommAndChans.channels[c].peers = comm->channels[c].devPeers;
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
     tmpCommAndChans.channels[c].ring.userRanks = comm->channels[c].devRingUserRanks;
@@ -435,9 +440,15 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     }
   }
 
+#if defined(ENABLE_NPKIT)
+  // Init NPKit
+  NCCLCHECK(NpKit::Init(comm->rank));
+  tmpCommAndChans.comm.npKitEventCollectContexts = NpKit::GetGpuEventCollectContexts();
+  tmpCommAndChans.comm.cpuTimestamp = NpKit::GetCpuTimestamp();
+#endif
   NCCLCHECKGOTO(ncclCudaMemcpyAsync(devCommAndChans, &tmpCommAndChans, 1, comm->sharedRes->deviceStream.cudaStream), ret, fail);
 exit:
-  CUDACHECK(cudaStreamSynchronize(comm->sharedRes->deviceStream.cudaStream));
+  NCCLCHECK(ncclStrongStreamSynchronize(&comm->sharedRes->deviceStream));
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(), &comm->sharedRes->deviceStream));
   return ret;
 fail:
@@ -497,10 +508,11 @@ static ncclResult_t setupChannel(struct ncclComm* comm, int channelId, int rank,
   return ncclSuccess;
 }
 
-#define DEFAULT_LL_BUFFSIZE (NCCL_LL_LINES_PER_THREAD*NCCL_LL_MAX_NTHREADS*NCCL_STEPS*sizeof(union ncclLLFifoLine))
+#define DEFAULT_LL_BUFFSIZE (NCCL_LL_LINES_PER_THREAD*NCCL_MAX_NTHREADS*NCCL_STEPS*sizeof(union ncclLLFifoLine))
 #define DEFAULT_LL128_BUFFSIZE (NCCL_LL128_ELEMS_PER_THREAD*NCCL_LL128_MAX_NTHREADS*NCCL_STEPS*sizeof(uint64_t))
 #define DEFAULT_BUFFSIZE (1 << 22) /* 4MiB */
 #define DEFAULT_BUFFSIZE_ARM (1 << 20) /* 1MiB */
+// TODO(anonymous): honor
 NCCL_PARAM(BuffSize, "BUFFSIZE", -2);
 NCCL_PARAM(LlBuffSize, "LL_BUFFSIZE", -2);
 NCCL_PARAM(Ll128BuffSize, "LL128_BUFFSIZE", -2);
@@ -531,7 +543,10 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
   } else {
     comm->sharedRes->tpP2pChunkSize = comm->p2pChunkSize;
   }
-
+  if (comm->tuner != NULL && comm->p2pChunkSize > (*comm->tunerEnvs)["tuner_p2pChunkSize"]) {
+    (*comm->tunerEnvs)["tuner_p2pChunkSize"] = comm->p2pChunkSize;
+    WARN("[Tuner] Native nccl uses larger chunk: comm->p2pChunkSize=%d, nTasksP2p=%d", comm->p2pChunkSize, (*comm->tunerEnvs)["tuner_p2pChunkSize"]);
+  }
   INFO(NCCL_INIT, "P2P Chunksize set to %d", comm->p2pChunkSize);
   return ncclSuccess;
 }
@@ -539,6 +554,7 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
 NCCL_PARAM(GraphDumpFileRank, "GRAPH_DUMP_FILE_RANK", 0);
 NCCL_PARAM(CollNetNodeThreshold, "COLLNET_NODE_THRESHOLD", 2);
 NCCL_PARAM(NvbPreconnect, "NVB_PRECONNECT", 1);
+// TODO(anonymous): honor this param
 NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
 
 static ncclResult_t collNetTrySetup(ncclComm_t comm, ncclComm_t parent, struct ncclTopoGraph* collNetGraph) {
@@ -745,6 +761,168 @@ fail:
   goto exit;
 }
 
+const int32_t getEnvOrDefault(const char *env, const int32_t& defaultValue) {
+  const char* str = getenv(env);
+  return str ? atoi(str) : defaultValue;
+}
+
+ncclResult_t initTunerEnvs(struct ncclComm* comm) {
+  (*comm->tunerEnvs)["tuner_chunkPipeline_disable"] = 1;
+  (*comm->tunerEnvs)["tuner_extraP2PCE"] = 0;
+  (*comm->tunerEnvs)["tuner_extraP2PCE_disable"] = 1;
+  (*comm->tunerEnvs)["tuner_extraSHM"] = 0;
+  (*comm->tunerEnvs)["tuner_extraSHM_disable"] = 1;
+  (*comm->tunerEnvs)["tuner_gdrLevel"] = -1;
+  (*comm->tunerEnvs)["tuner_nChannels"] = 0;
+  (*comm->tunerEnvs)["tuner_p2pChunkSize"] = 0;
+  (*comm->tunerEnvs)["tuner_p2pLevel"] = -1;
+  (*comm->tunerEnvs)["tuner_p2pChunkSize"] = 0;
+  (*comm->tunerEnvs)["tuner_p2pnChannels"] = 0;
+  (*comm->tunerEnvs)["tuner_p2pnChannelsPerPeer"] = 0;
+  int device;
+  cudaDeviceProp prop;  // NOLINT
+  cudaGetDevice(&device);
+  cudaGetDeviceProperties(&prop, device);
+  int runtimeVersion = 0;
+  cudaRuntimeGetVersion(&runtimeVersion);
+  {
+    int32_t user_set = getEnvOrDefault("TUNER_TREEUPDOWN_ALLREDUCE_SIMPLE_NATIVE", -1);
+    if (runtimeVersion >= 11020 && runtimeVersion < 11040 && prop.major >= 8) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple_native"] = 1;
+      WARN("Based on hardware and driver, Native version will use treeupdown for allreduce simple");
+    } else {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple_native"] = 0;
+    }
+    if (user_set != -1) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple_native"] = user_set;
+    }
+    user_set = getEnvOrDefault("TUNER_TREEUPDOWN_ALLREDUCE_LL128_LL_NATIVE", -1);
+    (*comm->tunerEnvs)["tuner_treeupdown_allreduce_ll128_ll_native"] = 0;
+    if (user_set != -1) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_ll128_ll_native"] = user_set;
+    }
+  }
+  if (comm->tuner == NULL) {
+    return ncclSuccess;
+  }
+  static_assert(TUNER_MAXCHANNELS >= MAXCHANNELS, "make sure TUNER_MAXCHANNELS >= MAXCHANNELS");
+
+  {
+    int32_t user_nchannels = getEnvOrDefault("TUNER_NCHANNELS", TUNER_MAXCHANNELS);
+    if (user_nchannels > prop.multiProcessorCount * 2) {
+      // should not larger than number of SMs * 2
+      WARN("user_nchannels > %d, user_nchannels set to %d", prop.multiProcessorCount * 2, prop.multiProcessorCount * 2);
+      user_nchannels = prop.multiProcessorCount * 2;
+    }
+    (*comm->tunerEnvs)["tuner_nChannels"] = user_nchannels;
+  }
+  {
+    int32_t user_p2p_nchannels = getEnvOrDefault("TUNER_P2P_NCHANNELS", TUNER_MAXCHANNELS);
+    if (user_p2p_nchannels > 0 && (user_p2p_nchannels & (user_p2p_nchannels - 1)) != 0) {
+      WARN("make sure user_p2p_nchannels is power of 2");
+      return ncclInternalError;
+    }
+    int tuner_max_p2pnChannels = 1;
+    while (tuner_max_p2pnChannels <= prop.multiProcessorCount) {
+      tuner_max_p2pnChannels *= 2;
+    }
+    if (user_p2p_nchannels > tuner_max_p2pnChannels) {
+      WARN("user_p2p_nchannels > %d, user_p2p_nchannels set to %d", tuner_max_p2pnChannels, tuner_max_p2pnChannels);
+      user_p2p_nchannels = tuner_max_p2pnChannels;
+    }
+    (*comm->tunerEnvs)["tuner_p2pnChannels"] = user_p2p_nchannels;
+    int32_t user_p2p_nchannels_per_peer = getEnvOrDefault("TUNER_P2P_NCHANNELS_PER_PEER", user_p2p_nchannels);
+    if (user_p2p_nchannels_per_peer > user_p2p_nchannels) {
+      WARN("user_p2p_nchannels_per_peer > %d, user_p2p_nchannels_per_peer set to %d", user_p2p_nchannels, user_p2p_nchannels);
+      user_p2p_nchannels_per_peer = user_p2p_nchannels;
+    }
+    (*comm->tunerEnvs)["tuner_p2pnChannelsPerPeer"] = user_p2p_nchannels_per_peer;
+  }
+  {
+    int32_t user_extra_shm_disable = getEnvOrDefault("TUNER_EXTRA_SHM_DISABLE", 1);
+    (*comm->tunerEnvs)["tuner_extraSHM_disable"] = user_extra_shm_disable;
+    (*comm->tunerEnvs)["tuner_extraSHM"] = 0;
+  }
+  {
+    int32_t user_extra_p2pce_disable = getEnvOrDefault("TUNER_EXTRA_P2PCE_DISABLE", 1);
+    bool ceSupport = true;
+    int32_t user_max_connections = getEnvOrDefault("CUDA_DEVICE_MAX_CONNECTIONS", -1);
+    int32_t user_launch_blocking = getEnvOrDefault("CUDA_LAUNCH_BLOCKING", 0);
+    if (user_max_connections != -1 && user_max_connections < 2) {
+      ceSupport = false;
+    } else if (!prop.deviceOverlap) {
+      ceSupport = false;
+    } else if (prop.asyncEngineCount < 2) {
+      // TODO: use dynamic parallelism to launch more sm_copy or cudaMemcpyAsync
+      ceSupport = false;
+    } else if (user_launch_blocking > 0) {
+      ceSupport = false;
+    }
+    if (ceSupport == false) {
+      user_extra_p2pce_disable = 1;
+    }
+    (*comm->tunerEnvs)["tuner_extraP2PCE_disable"] = user_extra_p2pce_disable;
+    (*comm->tunerEnvs)["tuner_extraP2PCE"] = 0;
+  }
+  {
+    int32_t user_p2pLevel = -1;
+    int p2pLevel = -1;
+    NCCLCHECK(ncclGetLevel(&p2pLevel, NULL, "TUNER_P2P_LEVEL"));
+    if (p2pLevel != -2) {
+      user_p2pLevel = p2pLevel;
+    }
+    (*comm->tunerEnvs)["tuner_p2pLevel"] = user_p2pLevel;
+  }
+  {
+    int32_t user_p2p_chunk_size = getEnvOrDefault("TUNER_P2P_CHUNK_SIZE", TUNER_P2PCHUNKSIZE);
+    if (user_p2p_chunk_size < TUNER_P2PCHUNKSIZE) {
+      WARN("user_p2p_chunk_size > %d, user_p2p_chunk_size set to %d", TUNER_P2PCHUNKSIZE, TUNER_P2PCHUNKSIZE);
+      user_p2p_chunk_size = TUNER_P2PCHUNKSIZE;
+    }
+    (*comm->tunerEnvs)["tuner_p2pChunkSize"] = user_p2p_chunk_size;
+  }
+  {
+    int32_t user_chunk_pipeline_disable = getEnvOrDefault("TUNER_CHUNK_PIPELINE_DISABLE", 1);
+    (*comm->tunerEnvs)["tuner_chunkPipeline_disable"] = user_chunk_pipeline_disable;
+  }
+  {
+    int32_t user_gdrLevel = -1;
+    int gdrLevel = -1;
+    NCCLCHECK(ncclGetLevel(&gdrLevel, NULL, "TUNER_NET_GDR_LEVEL"));
+    if (gdrLevel != -2) {
+      user_gdrLevel = gdrLevel;
+    }
+    (*comm->tunerEnvs)["tuner_gdrLevel"] = user_gdrLevel;
+  }
+  // {
+  //   int32_t user_gdrLevel_all2all = -1;
+  //   int gdrLevel = -1;
+  //   NCCLCHECK(ncclGetLevel(&gdrLevel, NULL, "TUNER_NET_GDR_LEVEL_ALL2ALL"));
+  //   if (gdrLevel != -2) {
+  //     user_gdrLevel_all2all = gdrLevel;
+  //   }
+  //   (*comm->tunerEnvs)["tuner_gdrLevel_all2all"] = user_gdrLevel_all2all;
+  // }
+  {
+    int32_t user_set = getEnvOrDefault("TUNER_TREEUPDOWN_ALLREDUCE_SIMPLE", -1);
+    if (runtimeVersion >= 11020 && runtimeVersion < 11040 && prop.major >= 8) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple"] = 1;
+      WARN("Based on hardware and driver, Tuner version will use treeupdown for allreduce simple");
+    } else {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple"] = 0;
+    }
+    if (user_set != -1) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_simple"] = user_set;
+    }
+    user_set = getEnvOrDefault("TUNER_TREEUPDOWN_ALLREDUCE_LL128_LL", -1);
+    (*comm->tunerEnvs)["tuner_treeupdown_allreduce_ll128_ll"] = 0;
+    if (user_set != -1) {
+      (*comm->tunerEnvs)["tuner_treeupdown_allreduce_ll128_ll"] = user_set;
+    }
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent = NULL) {
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
@@ -913,6 +1091,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Initialize num P2P LL buffers for this communicator
   comm->allocP2pNetLLBuffers = ncclParamAllocP2pNetLLBuffers() == 1;
+  // overwrite for tuner
+  // comm->allocP2pNetLLBuffers = true;
 
   if (comm->rank == ncclParamGraphDumpFileRank()) {
     struct ncclTopoGraph* dumpGraphs[4] = { &ringGraph, &treeGraph, &collNetGraph, &nvlsGraph };
@@ -1027,22 +1207,20 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
   }
 
-  NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&rings, nranks*TUNER_MAXCHANNELS), ret, fail);
+  // copy channels to tuner_nChannels
   NCCLCHECKGOTO(ncclTopoPostset(comm, nodesFirstRank, nodesTreePatterns, allTopoRanks, rings, graphs), ret, fail);
   // AllGather3 - end
 
-  TRACE(NCCL_INIT, "rank %d nranks %d - BUILT %d TREES/RINGS", rank, nranks, comm->nChannels);
+  INFO(NCCL_INIT, "rank %d nranks %d - BUILT comm->nChannels=%d TREES/RINGS -> tuner_nChannels=%d TREES/RINGS", rank, nranks, comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]);
 
-  char line[1024];
-  line[0]='\0';
-  for (int c=0; c<comm->nChannels; c++) {
-    struct ncclTree* tree = &comm->channels[c].tree;
-    snprintf(line+strlen(line), 1023-strlen(line), " [%d] %d/%d/%d->%d->%d",
-        c, tree->down[0], tree->down[1], tree->down[2], rank, tree->up);
+  for (int c=0; c<std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]); c++) {
     INFO(NCCL_GRAPH, "Ring %02d : %d -> %d -> %d", c, comm->channels[c].ring.prev, comm->rank, comm->channels[c].ring.next);
   }
-  line[1023] = '\0';
-  INFO(NCCL_INIT, "Trees%s", line);
+  for (int c=0; c<std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]); c++) {
+    struct ncclTree* tree = &comm->channels[c].tree;
+    INFO(NCCL_GRAPH, "Tree [%d] %d/%d/%d->%d->%d", c, tree->down[0], tree->down[1], tree->down[2], rank, tree->up);
+  }
 
   NCCLCHECKGOTO(computeBuffSizes(comm), ret, fail);
 
@@ -1069,10 +1247,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Launch proxy service thread, after this, the proxy calls can be used.
   NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
 
-  // Connect with prev/next for each ring
-  for (int c=0; c<comm->nChannels; c++) {
+  for (int c=0; c<std::max(std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]), (*comm->tunerEnvs)["tuner_p2pnChannels"]); c++) {
     struct ncclChannel* channel = comm->channels+c;
     NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
+  }
+
+  // Connect with prev/next for each ring
+  for (int c=0; c<std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]); c++) {
+    struct ncclChannel* channel = comm->channels+c;
     if (comm->nRanks == 1) continue;
     NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &channel->ring.prev, 1, &channel->ring.next, 0), ret, fail);
   }
@@ -1080,7 +1262,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   INFO(NCCL_INIT, "Connected all rings");
 
   // Connect Trees
-  for (int c=0; c<comm->nChannels; c++) {
+  for (int c=0; c<std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]); c++) {
     struct ncclChannel* channel = comm->channels+c;
     if (comm->nRanks == 1) continue;
     NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, NCCL_MAX_TREE_ARITY, channel->tree.down, 1, &channel->tree.up, 0), ret, fail);
@@ -1105,12 +1287,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Check if we can setup CollNet
   if (comm->collNetSupport > 0) collNetTrySetup(comm, parent, &collNetGraph);
 
-  TRACE(NCCL_INIT, "rank %d nranks %d - CONNECTED %d RINGS AND TREES", rank, nranks, comm->nChannels);
+  TRACE(NCCL_INIT, "rank %d nranks %d - CONNECTED %d RINGS AND TREES", rank, nranks, std::max(comm->nChannels, (*comm->tunerEnvs)["tuner_nChannels"]));
 
   // Compute time models for algorithm and protocol combinations
   NCCLCHECKGOTO(ncclTopoTuneModel(comm, comm->minCompCap, comm->maxCompCap, graphs), ret, fail);
 
   INFO(NCCL_INIT, "%d coll channels, %d nvls channels, %d p2p channels, %d p2p channels per peer", comm->nChannels, comm->nvlsChannels, comm->p2pnChannels, comm->p2pnChannelsPerPeer);
+  INFO(NCCL_INIT, "[Tuner] tuner_nChannels=%d", (*comm->tunerEnvs)["tuner_nChannels"]);
 
   do { // Setup p2p structures in comm->tasks
     struct ncclTasks* tasks = &comm->tasks;
@@ -1122,6 +1305,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     int steps = ALIGN_POWER(comm->maxLocalRanks, NCCL_MAX_WORK_ELEMENTS_P2P/2);
     tasks->p2pOrderSteps = comm->nNodes * steps;
     tasks->peers = ncclMemoryStackAlloc<ncclTasks::Peer>(&comm->memPermanent, tasks->p2pOrderSteps);
+    tasks->backup.peers = ncclMemoryStackAlloc<ncclTasks::Peer>(&comm->memPermanent, tasks->p2pOrderSteps);
     tasks->p2pSendOrder = ncclMemoryStackAlloc<int>(&comm->memPermanent, tasks->p2pOrderSteps);
     tasks->p2pRecvOrder = ncclMemoryStackAlloc<int>(&comm->memPermanent, tasks->p2pOrderSteps);
     int i=0;
@@ -1166,13 +1350,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       for (int c=0; c<comm->p2pnChannelsPerPeer; c++) {
         NCCLCHECKGOTO(ncclChannelCompute(comm, peer, c, ncclFuncSend, &channelId), ret, fail);
         if (comm->channels[channelId].peers[peer]->send[1].connected == 0) {
-          comm->connectSend[peer] |= (1UL<<channelId);
+          comm->connectSend[peer][channelId] = true;
         }
       }
       for (int c=0; c<comm->p2pnChannelsPerPeer; c++) {
         NCCLCHECKGOTO(ncclChannelCompute(comm, peer, c, ncclFuncRecv, &channelId), ret, fail);
         if (comm->channels[channelId].peers[peer]->recv[1].connected == 0) {
-          comm->connectRecv[peer] |= (1UL<<channelId);
+          comm->connectRecv[peer][channelId] = true;
         }
       }
     }
@@ -1183,7 +1367,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Connect to local net proxy
   tpProxyRank = comm->topParentRanks[comm->rank];
   NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, tpProxyRank, &proxyConn), ret, fail);
-  NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
+  NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, comm->p2pnChannels > (*comm->tunerEnvs)["tuner_p2pnChannels"] ? &comm->p2pnChannels : &(*comm->tunerEnvs)["tuner_p2pnChannels"], sizeof(int), NULL, 0), ret, fail);
 
   // Then to remote ones when using PXN
   if (ncclPxnDisable(comm) == 0) {
@@ -1192,7 +1376,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     for (int r=0; r<nranks; r++) {
       tpProxyRank = comm->topParentRanks[pxnPeers[r]];
       NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, tpProxyRank, &proxyConn), ret, fail);
-      NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
+      NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, comm->p2pnChannels > (*comm->tunerEnvs)["tuner_p2pnChannels"] ? &comm->p2pnChannels : &(*comm->tunerEnvs)["tuner_p2pnChannels"], sizeof(int), NULL, 0), ret, fail);
     }
   }
 
@@ -1344,9 +1528,11 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     if (job->color == NCCL_SPLIT_NOCOLOR) goto exit;
     snprintf((char*)&job->commId, sizeof(job->commId), "%016lx-%d", job->parent->commHash, job->color);
     NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);
+    comm->tunerEnvs = new std::map<std::string, int32_t>();
     NCCLCHECKGOTO(bootstrapSplit((struct ncclBootstrapHandle*)&job->commId, comm, job->parent, job->color, job->key, parentRanks), res, fail);
   } else {
     NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
+    comm->tunerEnvs = new std::map<std::string, int32_t>();
     NCCLCHECKGOTO(bootstrapInit((struct ncclBootstrapHandle*)&job->commId, comm), res, fail);
   }
 
@@ -1355,7 +1541,54 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
 
   INFO(NCCL_INIT,"comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%llx - Init START", comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, (unsigned long long)hashUniqueId(job->commId));
 
+  NCCLCHECKGOTO(ncclLoadTunerPlugin(&comm->tuner), res, fail);
+  NCCLCHECKGOTO(initTunerEnvs(comm), res, fail);
+
+  for (const auto &pair : *comm->tunerEnvs) {
+    INFO(NCCL_INIT,"%" PRIu64 " tunerEnvs %s=%d", comm->commHash, pair.first.c_str(), pair.second);
+  }
+
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent), res, fail);
+
+  // TODO(anonymous): honor the algo, protocol, p2p, nc, nt, buffer size
+  if (comm->tuner != NULL) {
+    NCCLCHECK(comm->tuner->init(comm->commHash, comm->nRanks, comm->nNodes, comm->rank, comm->node, comm->cudaDev, (*comm->tunerEnvs), comm->bootstrap));
+    // TODO(anonymous): honor comm->p2pChunkSize for nvl cluster
+    int maxSlots = (*comm->tunerEnvs)["tuner_p2pnChannels"]*NCCL_MAX_WORK_ELEMENTS_P2P/2;
+    if (maxSlots > 0 && (maxSlots & (maxSlots - 1)) != 0) {
+      WARN("make sure maxSlots is power of 2");
+      return ncclInternalError;
+    }
+    for (int c=0; c<maxSlots; c++) {
+      int nSlots = maxSlots;
+      int mirror = 0;
+      for (int b=1, mb=(nSlots>>1); b<nSlots; b<<=1, mb>>=1) if (c & b) mirror |= mb;
+      comm->p2pSlotsForTuner[c] = mirror;
+    }
+    for (int c=0; c<(*comm->tunerEnvs)["tuner_p2pnChannels"]; c++) {
+      int nChannels = (*comm->tunerEnvs)["tuner_p2pnChannels"];
+      int mirror = 0;
+      for (int b=1, mb=(nChannels>>1); b<nChannels; b<<=1, mb>>=1) if (c & b) mirror |= mb;
+      comm->p2pChannelsForTuner[c] = mirror;
+    }
+    // memory footprint
+    size_t buffer_size = 0;
+    for (int p=0; p < NCCL_NUM_PROTOCOLS; p++) {
+      buffer_size += comm->buffSizes[p];
+    }
+    size_t coll_size = (*comm->tunerEnvs)["tuner_nChannels"]*(2*1024*1024+buffer_size);
+    size_t coll_size_ce = (*comm->tunerEnvs)["tuner_nChannels"]*(2*1024*1024+buffer_size);
+    size_t sendrecv_size = (*comm->tunerEnvs)["tuner_p2pnChannels"]*(comm->maxLocalRanks-1)*(2*1024*1024+buffer_size);
+    size_t sendrecv_size_ce = (*comm->tunerEnvs)["tuner_p2pnChannels"]*(comm->maxLocalRanks-1)*(comm->buffSizes[NCCL_PROTO_SIMPLE]+buffer_size);
+    size_t sendrecv_size_nodes = (*comm->tunerEnvs)["tuner_p2pChunkSize"]*NCCL_MAX_WORK_ELEMENTS_P2P*(*comm->tunerEnvs)["tuner_p2pnChannels"];
+    size_t total_coll_size = coll_size * 2; // ring and tree may connect with different peers
+    if ((*comm->tunerEnvs)["tuner_extraP2PCE"]) total_coll_size += coll_size_ce;
+    size_t total_sendrecv_size = sendrecv_size;
+    if ((*comm->tunerEnvs)["tuner_extraP2PCE"]) total_sendrecv_size += sendrecv_size_ce;
+    total_sendrecv_size += sendrecv_size_nodes;
+
+    INFO(NCCL_INIT, "Alloate buffer: total_coll_size=%f GB, total_sendrecv_size=%f GB", total_coll_size/1024.0/1024/1024, total_sendrecv_size/1024.0/1024/1024);
+  }
 
   // update communicator state
   comm->initState = ncclSuccess;
@@ -1740,10 +1973,25 @@ static ncclResult_t commDestroySync(struct ncclAsyncJob* job_) {
   int commDevice = comm->cudaDev;
   ncclResult_t ret = ncclSuccess;
 
+#if defined(ENABLE_NPKIT)
+  const char* npkitDumpDir = nullptr;
+#endif
+
   CUDACHECKGOTO(cudaGetDevice(&savedDevice), ret, fail);
   if (savedDevice != commDevice) {
     CUDACHECKGOTO(cudaSetDevice(commDevice), ret, fail);
   }
+
+#if defined(ENABLE_NPKIT)
+  // Dump NPKit events and shutdown
+  npkitDumpDir = getenv("NPKIT_DUMP_DIR");
+  if (npkitDumpDir == nullptr) {
+    WARN("NPKIT_DUMP_DIR is empty");
+  } else {
+    NCCLCHECKGOTO(NpKit::Dump(npkitDumpDir), ret, fail);
+  }
+  NCCLCHECKGOTO(NpKit::Shutdown(), ret, fail);
+#endif
 
   TRACE(NCCL_INIT, "Destroying comm %p rank %d abortFlag %d asyncResult %d", comm, comm->rank, *comm->abortFlag, comm->asyncResult);
 
@@ -1775,6 +2023,11 @@ static ncclResult_t commCleanup(ncclComm_t comm) {
   CUDACHECK(cudaGetDevice(&savedDevice));
   if (savedDevice != commDevice) {
     CUDACHECK(cudaSetDevice(commDevice));
+  }
+
+  if (comm->tuner != NULL) {
+    NCCLCHECK(comm->tuner->destroy(comm->commHash));
+    ncclCloseTunerPlugin(&comm->tuner);
   }
 
   NCCLCHECK(commFree(comm));

@@ -12,13 +12,14 @@
 #include "profiler.h"
 #define ENABLE_TIMER 0
 #include "timer.h"
+#include "enqueue.h"
 
 #include <sys/syscall.h>
 #include <assert.h>
 
 enum { proxyRecv=0, proxySend=1 };
 
-static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
+bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
   if (pattern == ncclPatternRing || pattern == ncclPatternRingTwice) return true;
 
   /* In chains, one rank does not need a proxy. Let's figure out which one it is */
@@ -501,9 +502,11 @@ static ncclResult_t ncclLocalOpAppend(struct ncclComm* comm, struct ncclProxyCon
 
 static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel, int type, int peer, struct ncclProxyOp* op, int connIndex, bool* justInquire) {
   if (peer < 0) return ncclSuccess;
-
+  uint8_t transportIndex;
+  NCCLCHECK(chooseTransport(comm, channel->id, peer, op->isCopyEngineNotSmCopy, op->p2pLevel, &transportIndex));
   struct ncclChannelPeer* peerComm = channel->peers[peer];
-  struct ncclConnector* connector = type == proxyRecv ? peerComm->recv+connIndex : peerComm->send+connIndex;
+  struct ncclConnector* connector = type == proxyRecv ? peerComm->recv+connIndex+NCCL_MAX_CONNS*transportIndex : peerComm->send+connIndex+NCCL_MAX_CONNS*transportIndex;
+  TRACE(NCCL_PROXY, "%s:%d channle=%d peer=%d %s connIndex=%d transportComm=%p, head=%p, tail=%p, step=%p", __FILE__, __LINE__, channel->id, peer, (type == proxyRecv ? "recv" : "send"), connIndex+NCCL_MAX_CONNS*transportIndex, connector->transportComm, connector->conn.head, connector->conn.tail, connector->conn.step);
   if (connector->transportComm == NULL) {
     WARN("Rank %d has no transport for %s peer %d on channel %d/%d", comm->rank,
         type == proxyRecv ? "recv" : "send", peer, channel->id, connIndex);
@@ -583,6 +586,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   return ncclSuccess;
 }
 
+// TODO(anonymous): honor
 NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
 
 ncclResult_t ncclProxyComputeP2p(struct ncclInfo* info, struct ncclProxyOp* op) {
@@ -1305,7 +1309,8 @@ static ncclResult_t proxyProgressAsync(struct ncclProxyAsyncOp* op, struct ncclP
     TRACE(NCCL_PROXY, "proxyProgressAsync::proxyConnect() opId=%p op.reqBuff=%p", op->opId, op->reqBuff);
     NCCLCHECK(op->connection->tcomm->proxyConnect(op->connection, proxyState, op->reqBuff, op->reqSize, op->respBuff, op->respSize, &done));
   } else if (op->type == ncclProxyMsgSharedInit) {
-    int nChannels = (int) *op->reqBuff;
+    // int nChannels = (int) *op->reqBuff;
+    int nChannels = *(int*)op->reqBuff;
     TRACE(NCCL_PROXY, "proxyProgressAsync::ncclProxyMsgSharedInit opId=%p op.reqBuff=%p nChannels=%d", op->opId, op->reqBuff, nChannels);
     if (op->connection->tcomm->proxySharedInit) NCCLCHECK(op->connection->tcomm->proxySharedInit(op->connection, proxyState, nChannels));
     __atomic_store_n(&op->connection->state, connSharedInitialized, __ATOMIC_RELEASE);
@@ -1568,9 +1573,9 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
     proxyState->tpLocalnRanks = comm->localRanks;
     proxyState->cudaDev = comm->cudaDev;
     proxyState->abortFlag = comm->abortFlag;
-    proxyState->p2pnChannels = comm->p2pnChannels;
-    proxyState->p2pChunkSize = comm->p2pChunkSize;
-    proxyState->nChannels = comm->nChannels;
+    proxyState->p2pnChannels = std::max(comm->p2pnChannels, (*comm->tunerEnvs)["tuner_p2pnChannels"]);
+    proxyState->p2pChunkSize = std::max(comm->p2pChunkSize, (*comm->tunerEnvs)["tuner_p2pChunkSize"]);
+    proxyState->nChannels = comm->nChannels; // TODO(anonymous)
     proxyState->allocP2pNetLLBuffers = comm->allocP2pNetLLBuffers;
     proxyState->dmaBufSupport = comm->dmaBufSupport;
     proxyState->ncclNet = comm->ncclNet;

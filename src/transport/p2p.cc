@@ -9,7 +9,10 @@
 #include "utils.h"
 #include "shm.h"
 #include "p2p.h"
-
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
+// #define DEBUG_BLOCK
 enum p2pType { P2P_DIRECT, P2P_INTERMEDIATE, P2P_IPC, P2P_CUMEM };
 
 struct ncclP2pBuff {
@@ -94,12 +97,14 @@ static int busIdToCudaDev(int64_t busId) {
   return -1;
 }
 
+// TODO(anonymous): honor
 // CE memcpy support
 NCCL_PARAM(P2pUseCudaMemcpy, "P2P_USE_CUDA_MEMCPY", 0);
-static int useMemcpy = 0;
+// static int useMemcpy = 0;
 static void initCeOperation();
 
 /* Determine if two peers can communicate through p2p */
+template <int useMemcpy = 0> 
 ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTopoGraph* graph, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2) {
   initCeOperation();
 
@@ -111,7 +116,7 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
 
   // Check topology / p2p level.
   int intermediateRank;
-  NCCLCHECK(ncclTopoCheckP2p(topo, info1->busId, info2->busId, ret, NULL, &intermediateRank));
+  NCCLCHECK(ncclTopoCheckP2p(topo, info1->busId, info2->busId, ret, NULL, &intermediateRank, false));
   if (*ret == 0) return ncclSuccess;
   if (intermediateRank != -1) {
     if (useMemcpy) *ret = 0;
@@ -283,11 +288,11 @@ ncclResult_t ncclP2pImportShareableBuffer(struct ncclComm *comm, int tpPeer, siz
 NCCL_PARAM(P2pReadEnable, "P2P_READ_ENABLE", -2);
 NCCL_PARAM(P2pDirectDisable, "P2P_DIRECT_DISABLE", 0);
 
-static ncclResult_t p2pGetInfo(struct ncclTopoSystem* topo, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2, int* read, int* intermediateRank) {
+static ncclResult_t p2pGetInfo(struct ncclComm* comm, struct ncclTopoSystem* topo, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2, int* read, int* intermediateRank) {
   int p2p;
   // Queries the topology to see if the GPUs are Ampere and
   // connected via NVLink, if so we enable P2P Read by default
-  NCCLCHECK(ncclTopoCheckP2p(topo, info1->busId, info2->busId, &p2p, read, intermediateRank));
+  NCCLCHECK(ncclTopoCheckP2p(topo, info1->busId, info2->busId, &p2p, read, intermediateRank, (*comm->tunerEnvs)["tuner_extraP2PCE_disable"] && (*comm->tunerEnvs)["tuner_extraSHM_disable"], (*comm->tunerEnvs)["tuner_p2pLevel"]));
 
   int readEnable = ncclParamP2pReadEnable();
   if (readEnable != -2) *read = readEnable;
@@ -325,6 +330,7 @@ static ncclResult_t p2pMap(struct ncclComm *comm, struct ncclPeerInfo* myInfo, s
 }
 
 /* Send: Create and return connect structures for this peer to connect to me */
+template <int useMemcpy = 0> 
 ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* myInfo, struct ncclPeerInfo* peerInfo,
     struct ncclConnect* connectInfo, struct ncclConnector* send, int channelId, int connIndex) {
   struct p2pResources* resources;
@@ -332,7 +338,7 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   NCCLCHECK(ncclCalloc(&resources, 1));
   send->transportResources = resources;
   int useRead, intermediateRank;
-  NCCLCHECK(p2pGetInfo(comm->topo, myInfo, peerInfo, &useRead, &intermediateRank));
+  NCCLCHECK(p2pGetInfo(comm, comm->topo, myInfo, peerInfo, &useRead, &intermediateRank));
   if (useMemcpy) useRead = 0;
 
   static_assert(sizeof(struct p2pConnectInfo) <= sizeof(struct ncclConnect), "p2p Connect Info is too big");
@@ -377,7 +383,11 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   }
 
   tpProxyRank = comm->topParentRanks[info->rank];
-  NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P, 1, tpProxyRank, &send->proxyConn));
+  if (useMemcpy) {
+    NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P_CE, 1, tpProxyRank, &send->proxyConn));
+  } else {
+    NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P, 1, tpProxyRank, &send->proxyConn));
+  }
   if (useMemcpy) {
     NCCLCHECK(ncclProxyCallBlocking(comm, &send->proxyConn, ncclProxyMsgSetup, NULL, 0, &resources->proxyInfo, sizeof(struct p2pShmProxyInfo)));
     info->shmSize = resources->proxyInfo.shmSize;
@@ -391,6 +401,7 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
 }
 
 /* Create and return connect structures for this peer to connect to me */
+template <int useMemcpy = 0> 
 ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* myInfo, struct ncclPeerInfo* peerInfo,
     struct ncclConnect* connectInfo, struct ncclConnector * recv, int channelId, int connIndex) {
   struct p2pResources* resources;
@@ -398,7 +409,7 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   NCCLCHECK(ncclCalloc(&resources, 1));
   recv->transportResources = resources;
   int useRead, intermediateRank;
-  NCCLCHECK(p2pGetInfo(comm->topo, myInfo, peerInfo, &useRead, &intermediateRank));
+  NCCLCHECK(p2pGetInfo(comm, comm->topo, myInfo, peerInfo, &useRead, &intermediateRank));
 
   static_assert(sizeof(struct p2pConnectInfo) <= sizeof(struct ncclConnect), "p2p Connect Info is too big");
   struct p2pConnectInfo* info = (struct p2pConnectInfo*)connectInfo;
@@ -434,7 +445,11 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   }
 
   tpProxyRank = comm->topParentRanks[info->rank];
-  NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P, 0, tpProxyRank, &recv->proxyConn));
+  if (useMemcpy) {
+    NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P_CE, 0, tpProxyRank, &recv->proxyConn));
+  } else {
+    NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_P2P, 0, tpProxyRank, &recv->proxyConn));
+  }
   NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, &recvSize, sizeof(int), &info->p2pBuff, sizeof(struct ncclP2pBuff)));
 
   NCCLCHECK(p2pMap(comm, myInfo, comm->peerInfo+info->rank, &info->p2pBuff, (void**)&resources->recvDevMem, &resources->recvMemIpc));
@@ -442,6 +457,7 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
 }
 
 /* Connect/Send to this peer */
+template <int useMemcpy = 0> 
 static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* connectInfo, int nranks, int rank, struct ncclConnector* send) {
   struct p2pResources* resources = (struct p2pResources*)send->transportResources;
   struct ncclRecvMem* remDevMem = NULL;
@@ -478,6 +494,7 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
 }
 
 /* Connect/Recv from this peer */
+template <int useMemcpy = 0> 
 ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectInfo, int nranks, int rank, struct ncclConnector* recv) {
   struct p2pResources* resources = (struct p2pResources*)recv->transportResources;
   struct p2pConnectInfo* info = (struct p2pConnectInfo*)connectInfo;
@@ -518,6 +535,7 @@ ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectIn
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 ncclResult_t p2pSendFree(struct ncclConnector* send) {
   struct p2pResources* resources = (struct p2pResources*)send->transportResources;
   if (resources) {
@@ -535,6 +553,7 @@ ncclResult_t p2pSendFree(struct ncclConnector* send) {
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 ncclResult_t p2pRecvFree(struct ncclConnector* recv) {
   struct p2pResources* resources = (struct p2pResources*)recv->transportResources;
   if (resources) {
@@ -555,6 +574,7 @@ ncclResult_t p2pRecvFree(struct ncclConnector* recv) {
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   if (useMemcpy) {
     // CE memcpy support
@@ -597,6 +617,7 @@ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, st
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 static ncclResult_t p2pRecvProxySetup(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   if (reqSize != sizeof(int)) return ncclInternalError;
   int size = *((int*)reqBuff);
@@ -617,6 +638,7 @@ static ncclResult_t p2pRecvProxySetup(struct ncclProxyConnection* connection, st
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 static ncclResult_t p2pSendProxyConnect(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   struct p2pShmProxyInfo* proxyInfo = (struct p2pShmProxyInfo*)connection->transportResources;
 
@@ -631,6 +653,7 @@ static ncclResult_t p2pSendProxyConnect(struct ncclProxyConnection* connection, 
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 static ncclResult_t p2pSendProxyFree(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState) {
   // CE memcpy support
   if (useMemcpy) {
@@ -663,6 +686,7 @@ static ncclResult_t p2pSendProxyFree(struct ncclProxyConnection* connection, str
   return ncclSuccess;
 }
 
+template <int useMemcpy = 0> 
 static ncclResult_t p2pRecvProxyFree(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState) {
   if (ncclCuMemEnable()) {
     struct p2pCuMemProxyInfo *proxyInfo = (struct p2pCuMemProxyInfo *) connection->transportResources;
@@ -680,6 +704,7 @@ static ncclResult_t p2pRecvProxyFree(struct ncclProxyConnection* connection, str
 }
 
 // CE memcpy support
+template <int useMemcpy = 0> 
 static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   if (args->state == ncclProxyOpReady) {
     for (int s=0; s<args->nsubs; s++) {
@@ -688,6 +713,9 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, stru
       // Round to next multiple of sliceSteps
       sub->base = ROUNDUP(resources->step, args->chunkSteps);
       sub->posted = sub->transmitted = sub->done = 0;
+#ifdef DEBUG_BLOCK
+      printf("ncclProxyOpReady: sub->base=%d, sub->posted=%d\n", sub->base, sub->posted);
+#endif
     }
     args->state = ncclProxyOpProgress;
   }
@@ -709,10 +737,32 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, stru
         volatile uint64_t* recvTail = &resources->ceRecvMem->tail;
         // Check GPU has sent everything
         if ((*recvTail > sub->base+sub->transmitted)) {
+#ifdef DEBUG_BLOCK
+          printf("cudaMemcpy: wait gpu_send modify tail=%llu > sub->base=%d + sub->transmitted=%d\n", *recvTail, sub->base, sub->transmitted);
+          cudaStreamSynchronize(resources->stream);
+          printf("stream clear\n");
+#endif
           int size = sizesFifo[buffSlot];
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_EXIT)
+          sub->npKitSizesFifo[buffSlot] = size;
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_EXIT)
+              NpKit::CollectCpuEvent(
+                  NPKIT_EVENT_P2P_SEND_ENTRY,
+                  sub->nsteps,
+                  uint64_t(sub->requests+buffSlot)/sizeof(void*),
+                  *(volatile uint64_t*)NpKit::GetCpuTimestamp(), sub->channelId);
+#endif
+
           CUDACHECK(cudaMemcpyAsync(resources->recvFifo+buffSlot*stepSize, resources->ceDevBuff+buffSlot*stepSize, size, cudaMemcpyDeviceToDevice, resources->stream));
           CUDACHECK(cudaEventRecord(resources->events[buffSlot], resources->stream));
           sub->transmitted += args->sliceSteps;
+#ifdef DEBUG_BLOCK
+          printf("call cudaMemcpyAsync from %p to %p, offset=buffSlot=%d * stepSize=%d, size=%d, sub->transmitted=%d\n", resources->ceDevBuff, resources->recvFifo, buffSlot, stepSize, size, sub->transmitted);
+          cudaStreamSynchronize(resources->stream);
+          printf("cudaMemcpy finished\n");
+#endif
         }
       }
       if (sub->done < sub->transmitted) {
@@ -720,13 +770,27 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, stru
         cudaError_t res = cudaEventQuery(resources->events[buffSlot]);
         if (res != cudaErrorNotReady) CUDACHECK(res);
         if (res == cudaSuccess) {
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_EXIT)
+          NpKit::CollectCpuEvent(
+              NPKIT_EVENT_P2P_SEND_EXIT,
+              sub->npKitSizesFifo[buffSlot],
+              uint64_t(sub->requests+buffSlot)/sizeof(void*),
+              *(volatile uint64_t*)NpKit::GetCpuTimestamp(), sub->channelId);
+#endif
+
           sub->done += args->sliceSteps;
           // Notify SHM
           resources->shm->recvMem.tail = sub->base + sub->done;
+#ifdef DEBUG_BLOCK
+          printf("cudaMemcpy sub done: update peer->step=%d = sub->base=%d + sub->done=%d\n", resources->shm->recvMem.tail, sub->base, sub->done, args->done);
+#endif
         }
         if (sub->done == sub->nsteps) {
           resources->step = sub->base + sub->nsteps;
           args->done++;
+#ifdef DEBUG_BLOCK
+          printf("cudaMemcpy done: update resources->step=%d = sub->base=%d + sub->nsteps=%d; args->done=%d\n", resources->step, sub->base, sub->nsteps, args->done);
+#endif
         }
       }
     }
@@ -744,14 +808,21 @@ struct ncclTransport p2pTransport = {
   { p2pRecvSetup, p2pRecvConnect, p2pRecvFree, NULL, p2pRecvProxySetup, NULL, p2pRecvProxyFree, NULL }
 };
 
+struct ncclTransport p2pTransportCE = {
+  "P2PCE",
+  p2pCanConnect<1>,
+  { p2pSendSetup<1>, p2pSendConnect<1>, p2pSendFree<1>, NULL, p2pSendProxySetup<1>, p2pSendProxyConnect<1>, p2pSendProxyFree<1>, p2pSendProxyProgress<1> },
+  { p2pRecvSetup<1>, p2pRecvConnect<1>, p2pRecvFree<1>, NULL, p2pRecvProxySetup<1>, NULL, p2pRecvProxyFree<1>, NULL }
+};
+
 static void initCeOperation() {
-  static int init = 0;
-  if (!init) {
-    useMemcpy = ncclParamP2pUseCudaMemcpy();
-    if (useMemcpy) {
-      p2pTransport.send.proxyConnect = p2pSendProxyConnect;
-      p2pTransport.send.proxyProgress = p2pSendProxyProgress;
-    }
-    init = 1;
-  }
+  // static int init = 0;
+  // if (!init) {
+  //   useMemcpy = ncclParamP2pUseCudaMemcpy();
+  //   if (useMemcpy) {
+  //     p2pTransport.send.proxyConnect = p2pSendProxyConnect;
+  //     p2pTransport.send.proxyProgress = p2pSendProxyProgress;
+  //   }
+  //   init = 1;
+  // }
 }

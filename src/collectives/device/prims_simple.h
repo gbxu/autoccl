@@ -4,6 +4,10 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit.h"
+#endif
+
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts>
 class Primitives<
@@ -44,6 +48,15 @@ class Primitives<
   };
   uint64_t *connStepPtr;
   uint64_t connStepCache; // Cache last seen value of (*connStepPtr)
+
+#if defined(ENABLE_NPKIT)
+public:
+  int npKitCtxIdx = 0;
+  uint64_t npKitDataProcessEntryTime = 0;
+  uint64_t npKitDataProcessExitTime = 0;
+  uint64_t npKitDataProcessTotalTime = 0;
+private:
+#endif
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -125,6 +138,8 @@ class Primitives<
     if (((flags & (Recv*RoleWaitRecv)) && !noRecvWait) ||
         ((flags & (Send*RoleWaitSend)) && !noSendWait)) {
       int spins = 0;
+      GPUPRINT((flags & (Recv*RoleWaitRecv)) && !noRecvWait, "RoleWaitRecv tid=%d, blocked by proxy tail=%llu(%p)+move=%d < step=%llu(gpu curr) + StepPerSlice=%d", tid, connStepCache, connStepPtr, (isSendNotRecv ? NCCL_STEPS : 0), step, StepPerSlice);
+      GPUPRINT((flags & (Send*RoleWaitSend)) && !noSendWait, "RoleWaitSend tid=%d, blocked by proxy head=%llu(%p)+move=%d < step=%llu(gpu curr) + StepPerSlice=%d", tid, connStepCache, connStepPtr, (isSendNotRecv ? NCCL_STEPS : 0), step, StepPerSlice);
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(spins)) break;
@@ -133,8 +148,11 @@ class Primitives<
     }
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
-      if (isSendNotRecv && (flags & SizesFifoEnabled))
+      if (isSendNotRecv && (flags & SizesFifoEnabled)) {
         connSizesFifoPtr[step%NCCL_STEPS] = nelts*sizeof(T);
+        GPUPRINT(flags & (Recv*RoleWaitRecv), "RoleWaitRecv tid=%d, notify proxy connSizesFifoPtr=%llu bytes", tid, nelts*sizeof(T));
+        GPUPRINT(flags & (Send*RoleWaitSend), "RoleWaitSend tid=%d, notify proxy connSizesFifoPtr=%llu bytes", tid, nelts*sizeof(T));
+      }
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -161,6 +179,8 @@ class Primitives<
         ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*stepSize;
       }
       step += StepPerSlice;
+      GPUPRINT(flags & (Recv*RoleWaitRecv), "RoleWaitRecv tid=%d, move step=%llu(gpu curr) after +%d", tid, step, StepPerSlice);
+      GPUPRINT(flags & (Send*RoleWaitSend), "RoleWaitSend tid=%d, move step=%llu(gpu curr) after +%d", tid, step, StepPerSlice);
     }
   }
 
@@ -170,10 +190,12 @@ class Primitives<
       step += StepPerSlice;
       if (Send && (flags & RolePostSend) && dataStored) fence_acq_rel_sys();
       st_relaxed_sys_global(connStepPtr, step);
+      GPUPRINT(flags & (Send*RolePostSend), "RolePostSend tid=%d, updates proxy tail=step(gpu curr)=%llu after +%d", tid, step, StepPerSlice);
+      GPUPRINT(flags & (Recv*RolePostRecv), "RolePostRecv tid=%d, updates proxy head=step(gpu curr)=%llu after +%d", tid, step, StepPerSlice);
     }
   }
 
-  template <int DirectRecv1, int DirectSend1, int Recv, int Send, int SrcBuf, int DstBuf>
+  template <int DirectRecv1, int DirectSend1, int Recv, int Send, int SrcBuf, int DstBuf, int ENTRY, int EXIT>
   __device__ __forceinline__ void genericOp(
       intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp
     ) {
@@ -187,7 +209,8 @@ class Primitives<
     sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
     int slice = 0;
     int offset = 0;
-
+    GPUEXEC(barrier());
+    GPUPRINT(tid == 0, "genericop start: nworkers=%d, SlicePerChunk=%d, StepPerSlice=%d nelem=%dT, userBuff=%p, srcIx=%ld, dstIx=%ld", nworkers, SlicePerChunk, StepPerSlice, nelem, userBuff, srcIx, dstIx);
     if (tid < nworkers && offset < nelem) {
       // Worker-only loop for non-empty slices. Non-workers and empty slices are
       // processed in the loop following this if block. The benefit of splitting
@@ -232,20 +255,92 @@ class Primitives<
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]) {
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send) {
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_ENTRY)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(ENTRY, sliceSize*sizeof(T), 0, clock64(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessEntryTime = clock64();
+            }
+#endif
+
             reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
               (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
                1, ncclShmem.groups[group].srcs,
                fan.nsend(), ncclShmem.groups[group].dsts+1,
                workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+            if (tid == 0) {
+              npKitDataProcessExitTime = clock64();
+              npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+            }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_EXIT)
+            if (tid == 0) {
+              NpKit::CollectGpuEvent(EXIT, sliceSize*sizeof(T), 0, clock64(),
+                  ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+            }
+#endif
+
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(ENTRY, sliceSize*sizeof(T), 0, clock64(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = clock64();
+          }
+#endif
+
           reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
             (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
              Recv, ncclShmem.groups[group].srcs,
              Dst, ncclShmem.groups[group].dsts,
              workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = clock64();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(EXIT, sliceSize*sizeof(T), 0, clock64(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         } else {
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_ENTRY)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(ENTRY, sliceSize*sizeof(T), 0, clock64(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessEntryTime = clock64();
+          }
+#endif
+
           constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
                                     DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
           reduceCopy<Unroll, RedOp, T,
@@ -255,13 +350,32 @@ class Primitives<
              Recv*fan.nrecv()+Src, ncclShmem.groups[group].srcs,
              Send*fan.nsend()+Dst, ncclShmem.groups[group].dsts,
              workSize);
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_PRIM_COLLECT_DATA_PROCESS_TIME)
+          if (tid == 0) {
+            npKitDataProcessExitTime = clock64();
+            npKitDataProcessTotalTime += npKitDataProcessExitTime - npKitDataProcessEntryTime;
+          }
+#endif
+
+#if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_EXIT)
+          if (tid == 0) {
+            NpKit::CollectGpuEvent(EXIT, sliceSize*sizeof(T), 0, clock64(),
+                ncclShmem.comm.npKitEventCollectContexts + npKitCtxIdx);
+          }
+#endif
+
         }
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < sliceSize);
         offset += sliceSize;
         slice += 1;
+        GPUEXEC(subBarrier());
+        GPUPRINT(tid == 0, "curr offset=%dT, curr slice idx=%d, after 1 slice", offset, slice);
       } while (slice < SlicePerChunk && offset < nelem);
     }
+    GPUEXEC(barrier());
+    GPUPRINT(tid == 0, "genericop end");
 
     // Non-workers come straight here. Workers too but only once the remaining
     // slices are all empty. Since empty slices are the uncommon case, and
@@ -353,12 +467,14 @@ class Primitives<
       if (flags & RolePostRecv) {
         connStepPtr = conn->head;
         *connStepPtr = step; // Return credits in case we rounded up.
+        GPUPRINT(true, "RolePostRecv head=step(%p)=%d", connStepPtr, step);
       }
       if (flags & RoleWaitRecv) {
         ncclShmem.groups[group].recvConns[index] = conn; // WaitRecv role saves since that's who needs it in setDataPtrs()
         flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
         connStepPtr = conn->tail;
         connStepCache = loadStepValue(connStepPtr);
+        GPUPRINT(true, "RoleWaitRecv tail=step(%p)=%d", connStepPtr, connStepCache);
         flags |= (conn->offsFifo != nullptr) ? OffsFifoEnabled : 0;
         if (Direct) {
           // User buffers have been registered
@@ -393,12 +509,14 @@ class Primitives<
       step = roundUp(step, SlicePerChunk*StepPerSlice);
       if (flags & RolePostSend) {
         connStepPtr = conn->tail;
+        GPUPRINT(true, "RolePostSend tail=step(%p)=%d", connStepPtr, *connStepPtr);
       }
       if (flags & RoleWaitSend) {
         ncclShmem.groups[group].sendConns[index] = conn; // WaitSend role saves since that's who needs it in setDataPtrs()
         flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
         connStepPtr = conn->head;
         connStepCache = loadStepValue(connStepPtr);
+        GPUPRINT(true, "RoleWaitSend head=step(%p)=%d", connStepPtr, connStepCache);
         flags |= (conn->offsFifo != nullptr) ? OffsFifoEnabled : 0;
         if (flags & OffsFifoEnabled)
           connOffsFifoPtr = conn->offsFifo;
@@ -434,7 +552,7 @@ class Primitives<
   __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,
-      uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, struct ncclWorkElem* e = nullptr
+      uint8_t connIndexRecv = 0, uint8_t connIndexSend = 0, uint8_t* transportIndex = nullptr, struct ncclWorkElem* e = nullptr
     ):
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
     stepSize(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T)) {
@@ -467,9 +585,16 @@ class Primitives<
     }
 
     int peer = 0;
-    if (flags & (RoleWaitRecv|RolePostRecv)) peer = recvPeers[index];
-    if (flags & (RoleWaitSend|RolePostSend)) peer = sendPeers[index];
-
+    if (flags & (RoleWaitRecv|RolePostRecv)) {
+      peer = recvPeers[index];
+      connIndexRecv = transportIndex ? connIndexRecv+transportIndex[index]*NCCL_MAX_CONNS : connIndexRecv;
+      GPUPRINT(true, "RoleWaitRecv|RolePostRecv tid=%d, peer=%d, index=%d, connIndexRecv=%d", tid, peer, index, connIndexRecv);
+    }
+    if (flags & (RoleWaitSend|RolePostSend)) {
+      peer = sendPeers[index];
+      connIndexSend = transportIndex ? connIndexSend+transportIndex[MaxRecv+index]*NCCL_MAX_CONNS : connIndexSend;
+      GPUPRINT(true, "RoleWaitSend|RolePostSend tid=%d, peer=%d, index=%d, connIndexSend=%d", tid, peer, index, connIndexSend);
+    }
     loadRecvConn(ncclShmem.channel.peers[peer], connIndexRecv, e);
     loadSendConn(ncclShmem.channel.peers[peer], connIndexSend, e);
 
@@ -576,62 +701,62 @@ class Primitives<
   }
 
   __device__ __forceinline__ void send(intptr_t inpIx, int eltN) {
-    genericOp<0, 0, 0, 1, Input, -1>(inpIx, -1, eltN, false);
+    genericOp<0, 0, 0, 1, Input, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_send_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_send_EXIT>(inpIx, -1, eltN, false);
   }
   __device__ __forceinline__ void sendFromOutput(intptr_t outIx, int eltN) {
-    genericOp<0, 0, 0, 1, Output, -1>(outIx, -1, eltN, false);
+    genericOp<0, 0, 0, 1, Output, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_sendFromOutput_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_sendFromOutput_EXIT>(outIx, -1, eltN, false);
   }
   __device__ __forceinline__ void directSend(intptr_t inpIx, intptr_t outIx, int eltN) {
-    genericOp<0, 1, 0, 1, Input, -1>(inpIx, outIx, eltN, false);
+    genericOp<0, 1, 0, 1, Input, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directSend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directSend_EXIT>(inpIx, outIx, eltN, false);
   }
   __device__ __forceinline__ void directSendFromOutput(intptr_t outIx, int eltN) {
-    genericOp<0, 1, 0, 1, Output, -1>(outIx, outIx, eltN, false);
+    genericOp<0, 1, 0, 1, Output, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directSendFromOutput_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directSendFromOutput_EXIT>(outIx, outIx, eltN, false);
   }
 
   __device__ __forceinline__ void recv(intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 0, -1, Output>(-1, outIx, eltN, postOp);
+    genericOp<0, 0, 1, 0, -1, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recv_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recv_EXIT>(-1, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directRecv(intptr_t outIx, int eltN) {
-    genericOp<1, 0, 1, 0, -1, Output>(-1, outIx, eltN, /*postOp=*/false);
+    genericOp<1, 0, 1, 0, -1, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecv_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecv_EXIT>(-1, outIx, eltN, /*postOp=*/false);
   }
 
   __device__ __forceinline__ void copySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 0, 0, 1, Input, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_copySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_copySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 1, 0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 1, 0, 1, Input, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directCopySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directCopySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvSend(int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 1, -1, -1>(-1, -1, eltN, postOp);
+    genericOp<0, 0, 1, 1, -1, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvSend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvSend_EXIT>(-1, -1, eltN, postOp);
   }
   __device__ __forceinline__ void recvCopySend(intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 1, -1, Output>(-1, outIx, eltN, postOp);
+    genericOp<0, 0, 1, 1, -1, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvCopySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvCopySend_EXIT>(-1, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directRecvCopySend(intptr_t outIx, int eltN) {
-    genericOp<1, 1, 1, 1, -1, Output>(-1, outIx, eltN, false);
+    genericOp<1, 1, 1, 1, -1, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvCopySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvCopySend_EXIT>(-1, outIx, eltN, false);
   }
   __device__ __forceinline__ void recvCopyDirectSend(intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 1, 1, 1, -1, Output>(-1, outIx, eltN, postOp);
+    genericOp<0, 1, 1, 1, -1, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvCopyDirectSend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvCopyDirectSend_EXIT>(-1, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 0, 1, 0, Input, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceCopy_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceCopy_EXIT>(inpIx, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);
+    genericOp<0, 0, 1, 1, Input, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceSend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceSend_EXIT>(inpIx, -1, eltN, postOp);
   }
   __device__ __forceinline__ void directRecvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
-    genericOp<1, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);
+    genericOp<1, 0, 1, 1, Input, -1, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvReduceSend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvReduceSend_EXIT>(inpIx, -1, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvReduceCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    genericOp<0, 0, 1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 0, 1, 1, Input, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceCopySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_recvReduceCopySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
   __device__ __forceinline__ void directRecvReduceCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
     // Direct is only for the send part
-    genericOp<0, 1, 1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    genericOp<0, 1, 1, 1, Input, Output, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvReduceCopySend_ENTRY, NPKIT_EVENT_PRIM_SIMPLE_DATA_PROCESS_FOR_directRecvReduceCopySend_EXIT>(inpIx, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void

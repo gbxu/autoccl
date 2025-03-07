@@ -22,5 +22,6 @@ ncclResult_t ncclLaunchKernelBefore_NoUncapturedCuda(struct ncclComm* comm, stru
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan);
 ncclResult_t ncclLaunchKernelAfter_NoCuda(struct ncclComm* comm, struct ncclKernelPlan* plan);
 ncclResult_t ncclLaunchFinish(struct ncclComm* comm);
+ncclResult_t chooseTransport(struct ncclComm* comm, int channelId, int peer, uint8_t isCopyEngineNotSmCopy, uint8_t p2pLevel, uint8_t* transportIndex);
 
 #endif // End include guard

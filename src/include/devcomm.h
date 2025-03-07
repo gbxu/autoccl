@@ -9,10 +9,13 @@
 
 #include "nccl.h"
 #include "align.h"
+#if defined(ENABLE_NPKIT)
+#include "npkit/npkit_struct.h"
+#endif
 #include <stdint.h>
 
 #define NCCL_NUM_FUNCTIONS 5 // Send/Recv not included for now
-typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv, ncclFuncSend, ncclFuncRecv, ncclNumFuncs} ncclFunc_t;
+typedef enum { ncclFuncBroadcast, ncclFuncReduce, ncclFuncAllGather, ncclFuncReduceScatter, ncclFuncAllReduce, ncclFuncSendRecv, ncclFuncSend, ncclFuncRecv, ncclNumFuncs, ncclFuncAll2All, ncclFuncAll2Allv} ncclFunc_t;
 extern const char* ncclFuncStr[NCCL_NUM_FUNCTIONS];
 
 #define NCCL_NUM_ALGORITHMS 6 // Tree/Ring/CollNet*
@@ -32,6 +35,35 @@ extern const char* ncclProtoStr[NCCL_NUM_PROTOCOLS];
 
 #define NCCL_MAX_OPS 2048
 #define NCCL_STEPS 8
+
+// #define TUNER_DEBUG
+#ifdef TUNER_DEBUG
+#include <stdio.h>
+#define GPUPRINT(expr, fmt, ...) \
+    if (expr) { \
+      uint smid; \
+      asm("mov.u32 %0, %smid;" : "=r"(smid) ); \
+      printf("%s:%d [blockIdx.x=%d/%d, threadIdx.x=%d/%d on SM%u] " #fmt ".\n", __FILE__, __LINE__, blockIdx.x, gridDim.x, threadIdx.x, blockDim.x, smid, ##__VA_ARGS__); \
+      __nanosleep(1000000);\
+    }
+#define GPUEXEC(expr) \
+    do { \
+        expr; \
+    } while (0)
+#else
+#define GPUPRINT(expr, fmt, ...) \
+  ; // do { (void)sizeof(expr); } while (0)
+#define GPUEXEC(expr) \
+  ; // do { (void)sizeof(expr); } while (0)
+#endif
+// chunksize upper bound for valid candidates of all2all
+// memory footprint: TUNER_MAXCHANNELS*16*128KB for send or recv
+#define TRANSPORT_NUM 3 // TODO(anonymous): may bring kernel loading overhead
+#define MASK_BITWIDTH 8*sizeof(uint64_t)
+#define MASK_ARRAY ((TUNER_MAXCHANNELS + MASK_BITWIDTH -1) / MASK_BITWIDTH)
+struct ChannelMask {
+  uint64_t values[MASK_ARRAY];
+};
 
 union ncclLLFifoLine {
   /* Flags have to be *after* data, because otherwise, an incomplete receive
@@ -166,9 +198,11 @@ struct ncclNvls {
 
 #define NCCL_MAX_CONNS 2
 struct ncclChannelPeer {
-  struct ncclConnector send[NCCL_MAX_CONNS];
-  struct ncclConnector recv[NCCL_MAX_CONNS];
+  struct ncclConnector send[NCCL_MAX_CONNS*TRANSPORT_NUM];
+  struct ncclConnector recv[NCCL_MAX_CONNS*TRANSPORT_NUM];
   int refCount;
+  uint8_t transportMask;
+  uint8_t p2pLevel;
 };
 
 struct ncclDevComm;
@@ -186,8 +220,9 @@ enum ncclWorkType : uint8_t {
 };
 enum ncclWorkP2PType : uint8_t {
   ncclWorkP2pTypeUnused=0,
-  ncclWorkP2pTypeSend,
-  ncclWorkP2pTypeRecv
+  ncclWorkP2pTypeSend=1,
+  ncclWorkP2pTypeRecv=2,
+  ncclWorkP2pTypeCount
 };
 
 struct ncclWorkHeader {
@@ -200,7 +235,8 @@ struct ncclWorkHeader {
   uint8_t inFifo:1; // is this work in the fifo
   enum ncclWorkType type;
 };
-
+#define EFFECTIVECHUNKSIZE_BITS 59
+#define LASTCHUNKSIZE_BITS 62
 struct ncclWorkElem {
   union {
     uint8_t flagBits;
@@ -210,26 +246,50 @@ struct ncclWorkElem {
   };
   uint8_t nWarps;
   uint8_t direct;
+  uint8_t bid;
+  uint32_t root : 23;
+  uint8_t native : 1;
+  uint8_t nChannels;
+  static_assert(UINT8_MAX >= TUNER_MAXCHANNELS, "must have enough bits");
+  uint8_t transportIndex[NCCL_MAX_TREE_ARITY+1+NCCL_MAX_TREE_ARITY+1];
+  static_assert(TRANSPORT_NUM <= (1<<8), "must have enough bits");
 
   const void * sendbuff;
   void * recvbuff;
 
   size_t count;
-  size_t lastChunkSize;
-  uint32_t root;
-  uint8_t bid;
-  uint8_t nChannels;
+  union {
+    struct {
+      uint64_t effectiveChunkSize : EFFECTIVECHUNKSIZE_BITS;
+      uint8_t userSliceSteps : 3;
+      uint8_t useAllReduceSimpleTreeUpDown : 1;
+      uint8_t useAllReduceLL128LLTreeUpDown : 1;
+    };
+    struct {
+      uint64_t lastChunkSize : LASTCHUNKSIZE_BITS;
+      uint8_t : 1;
+      uint8_t : 1;
+    };
+  };
+
   uint64_t redOpArg;
 };
+static_assert(sizeof(ncclWorkElem)==56); // (8+8+8)+64+64+64+64+(32+8+8)+64=392bits => 64*7
+static_assert(sizeof(ncclWorkHeader) == 8); // 32+16+2(pad to 8)+8=64bits
+static_assert(alignof(ncclWorkElem) == 8); // align 8 bytes due to uint64_t
+static_assert(alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElem)) == 8);
 
 #define NCCL_MAX_WORK_ELEMENTS ((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElem)))/sizeof(ncclWorkElem))
 static_assert(NCCL_MAX_WORK_ELEMENTS == 9, "Sanity check: NCCL_MAX_WORK_ELEMENTS == 9");
-
 struct ncclWorkElemP2p {
-  int peer : 30;
+  int peer : 29;
   int proto : 2;
-
-  enum ncclWorkP2PType p2pType;
+  static_assert(NCCL_NUM_PROTOCOLS < (1<<2), "protocol must have enough bits");
+  uint8_t native : 1;
+  uint8_t p2pType : 2;
+  static_assert(ncclWorkP2pTypeCount < (1<<2), "p2pType must have enough bits");
+  uint8_t transportIndex : 6;
+  static_assert(TRANSPORT_NUM <= (1<<6), "must have enough bits");
   uint8_t nWarps;
   uint8_t warpStart;
   uint8_t ngroups;
@@ -240,22 +300,29 @@ struct ncclWorkElemP2p {
   uint32_t buffHi32, buffLo32; // buff = buffHi32<<32 | buffLo32;
   //size_t count;
   uint32_t countHi32, countLo32; // count = countHi32<<32 | countLo32;
-  int chunkSize;
+  int effectiveChunkSize;
 };
 
-static_assert(((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemP2p)))/sizeof(ncclWorkElemP2p)) >= 16, "Sanity check: NCCL_MAX_WORK_ELEMENTS_P2P == 16");
+static_assert(sizeof(ncclWorkElemP2p)==28); // 29+2+1+6+2+8+8+8+32+32+32+32+32=224 bits=28 bytes
+static_assert(alignof(ncclWorkElemP2p) == 4);
+static_assert(alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemP2p)) == 8);
 #define NCCL_MAX_WORK_ELEMENTS_P2P 16
+static_assert(((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemP2p)))/sizeof(ncclWorkElemP2p)) >= NCCL_MAX_WORK_ELEMENTS_P2P, "Sanity check: NCCL_MAX_WORK_ELEMENTS_P2P == 16");
+
 
 struct ncclWorkElemReg {
-  struct ncclWorkElem elem;
-  void* dnInputs[NCCL_MAX_DIRECT_ARITY+1];
-  void* dnOutputs[NCCL_MAX_DIRECT_ARITY+1];
-  void* upOutputs[NCCL_MAX_DIRECT_ARITY+1];
+  struct ncclWorkElem elem; // 56 bytes
+  void* dnInputs[NCCL_MAX_DIRECT_ARITY+1]; // 8*(7+1) bytes
+  void* dnOutputs[NCCL_MAX_DIRECT_ARITY+1]; // 8*(7+1) bytes
+  void* upOutputs[NCCL_MAX_DIRECT_ARITY+1]; // 8*(7+1) bytes
 };
 
+static_assert(sizeof(ncclWorkElemReg)==248);
+static_assert(sizeof(ncclWorkHeader) == 8);
+static_assert(alignof(ncclWorkElemReg) == 8);
+static_assert(alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemReg)) == 8);
 #define NCCL_MAX_WORK_ELEMENTS_REG ((NCCL_WORK_SIZE - alignUp(sizeof(ncclWorkHeader), alignof(ncclWorkElemReg)))/sizeof(ncclWorkElemReg))
 static_assert(NCCL_MAX_WORK_ELEMENTS_REG == 2, "Sanity check: NCCL_MAX_WORK_ELEMENTS_REG == 2");
-
 // Number of named barriers supported by CUDA
 #define NCCL_MAX_GROUPS 16
 
@@ -274,8 +341,8 @@ static_assert(sizeof(struct ncclWork)%16 == 0, "Sanity check: sizeof(struct nccl
 struct ncclDevChannelPeer {
   // Stripped version of ncclChannelPeer where we only keep the ncclConnInfo
   // instead of the full ncclConnector.
-  struct ncclConnInfo send[NCCL_MAX_CONNS];
-  struct ncclConnInfo recv[NCCL_MAX_CONNS];
+  struct ncclConnInfo send[NCCL_MAX_CONNS*TRANSPORT_NUM];
+  struct ncclConnInfo recv[NCCL_MAX_CONNS*TRANSPORT_NUM];
 };
 
 struct alignas(16) ncclDevChannel {
@@ -302,11 +369,17 @@ struct ncclDevComm {
 
   // Channels, device side
   struct ncclDevChannel* channels/*[MAXCHANNELS]*/;
+
+#if defined(ENABLE_NPKIT)
+  NpKitEventCollectContext* npKitEventCollectContexts;
+  uint64_t* cpuTimestamp;
+#endif
+
 };
 
 struct alignas(16) ncclDevCommAndChannels {
   struct ncclDevComm comm;
-  struct ncclDevChannel channels[MAXCHANNELS];
+  struct ncclDevChannel channels[TUNER_MAXCHANNELS];
 };
 
 #ifdef __CUDA_ARCH__

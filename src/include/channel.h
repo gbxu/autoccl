@@ -29,6 +29,7 @@ static ncclResult_t ncclChannelComputeBase(struct ncclComm* comm, int peer, int 
     return ncclInternalError;
   }
   *channelBase = comm->nNodes > 1 ? delta+(step/p2pGroupSize) : step;
+  TRACE(NCCL_COLL, "native=1, peer=%d %s -> channelBase=%d", peer, (coll == ncclFuncSend ? "send" : "recv"), *channelBase);
   return ncclSuccess;
 }
 

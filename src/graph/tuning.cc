@@ -9,6 +9,7 @@
 #include "comm.h"
 #include "topo.h"
 
+// TODO(anonymous): honor
 NCCL_PARAM(Nthreads, "NTHREADS", -2);
 NCCL_PARAM(Ll128Nthreads, "LL128_NTHREADS", -2);
 
@@ -246,6 +247,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   int protoEnable[NCCL_NUM_PROTOCOLS] = { 1, 2, 1 };
   int algoEnable[NCCL_NUM_ALGORITHMS] = { 1, 1, 1, 1, 1, 1 };
 
+  // TODO(anonymous): honor
   const char *protoStr = getenv("NCCL_PROTO");
   if (protoStr) {
     INFO(NCCL_ENV, "NCCL_PROTO set by environment to %s", protoStr);

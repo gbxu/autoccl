@@ -1,0 +1,3 @@
+[submodule "ext-tuner/example/3rdparty/cereal"]
+	path = ext-tuner/example/3rdparty/cereal
+	url = https://github.com/USCiLab/cereal

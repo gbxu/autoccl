@@ -17,15 +17,26 @@ namespace {
     const int nChannels = args->nChannels;
     ncclRing *ring = &ncclShmem.channel.ring;
     int const *ringRanks = ring->userRanks;
-    const ssize_t chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? REDUCESCATTER_CHUNKSTEPS : 1));
-    // We should not need the final /2 but it makes performance much, much smoother. Might be a bug somewhere.
-    const ssize_t minChunkSizeLL128 = int(nthreads*(Proto::calcBytePerGrain()/sizeof(T))/2);
+    ssize_t chunkSize;
+    if (args->native) {
+      chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? REDUCESCATTER_CHUNKSTEPS : 1));
+    } else {
+      chunkSize = args->effectiveChunkSize * Proto::SlicePerChunk;
+    }
+    ssize_t minChunkSize;
+    if (Proto::Id == NCCL_PROTO_LL)
+      minChunkSize = nthreads*(Proto::calcBytePerGrain()/sizeof(T));
+    if (Proto::Id == NCCL_PROTO_LL128) {
+      // We should not need the final /2 but it makes performance much, much smoother. Might be a bug somewhere.
+      minChunkSize = int(nthreads*(Proto::calcBytePerGrain()/sizeof(T))/2); // minChunkSizeLL128
+    }
+
     const int nranks = ncclShmem.comm.nRanks;
     const ssize_t loopSize = nChannels*chunkSize;
     const ssize_t size = args->count;
 
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
+      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg, 0, 0, 0, args->transportIndex);
 
     for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
       ssize_t realChunkSize;
@@ -33,10 +44,16 @@ namespace {
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels));
         realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
       }
-      else if (Proto::Id == NCCL_PROTO_LL)
-        realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
-      else if (Proto::Id == NCCL_PROTO_LL128)
-        realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSizeLL128)*minChunkSizeLL128, chunkSize);
+      else if (Proto::Id == NCCL_PROTO_LL) {
+        if (args->native) {
+          realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
+        } else {
+          realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize, chunkSize);
+        }
+      }
+      else if (Proto::Id == NCCL_PROTO_LL128) {
+        realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize, chunkSize);
+      }
       realChunkSize = int(realChunkSize);
 
       ssize_t chunkOffset = gridOffset + bid*int(realChunkSize);
@@ -69,8 +86,22 @@ namespace {
 template<typename T, typename RedOp>
 struct RunWorkElement<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(ncclWorkElem *args) {
-    using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS/REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
-    runRing<T, RedOp, Proto>(args);
+    if (args->native) {
+      using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS/REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
+      runRing<T, RedOp, Proto>(args);
+    } else {
+      switch (args->userSliceSteps) {
+        case 1:
+          runRing<T, RedOp, ProtoSimple<REDUCESCATTER_CHUNKSTEPS/1/*slicePerChunk=4*/, 1/*StepPerSlice=1*/>>(args);
+          break;
+        case 2:
+          runRing<T, RedOp, ProtoSimple<REDUCESCATTER_CHUNKSTEPS/2/*slicePerChunk=2*/, 2/*StepPerSlice=2*/>>(args);
+          break;
+        case 4:
+          runRing<T, RedOp, ProtoSimple<REDUCESCATTER_CHUNKSTEPS/4/*slicePerChunk=1*/, 4/*StepPerSlice=4*/>>(args);
+          break;
+      }
+    }
   }
 };
 

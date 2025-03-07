@@ -14,14 +14,15 @@
 #include <pthread.h>
 #include "shm.h"
 #include "p2p.h"
+#include "graph/topo.h"
 
 enum ncclProxyOpState { ncclProxyOpNone, ncclProxyOpReady, ncclProxyOpProgress };
 
 struct ncclProxyArgs;
 typedef ncclResult_t (*proxyProgressFunc_t)(struct ncclProxyState*, struct ncclProxyArgs*);
 
-#define NCCL_PROXY_MAX_SUBS MAXCHANNELS
-static_assert(NCCL_MAX_WORK_ELEMENTS <= MAXCHANNELS, "Not enough sub space for max work elements");
+#define NCCL_PROXY_MAX_SUBS TUNER_MAXCHANNELS
+static_assert(NCCL_MAX_WORK_ELEMENTS <= TUNER_MAXCHANNELS, "Not enough sub space for max work elements");
 
 struct ncclProxyOp {
   struct ncclProxyConnection* connection;
@@ -38,8 +39,11 @@ struct ncclProxyOp {
   uint8_t /*ncclDataType_t*/ dtype;
   uint8_t /*ncclDevRedOp_t*/ redOp;
   uint8_t /*ncclPattern_t*/ pattern;
-  uint8_t protocol;
-
+  uint8_t protocol : 4;
+  static_assert(NCCL_NUM_PROTOCOLS < (1<<2), "protocol must have enough bits");
+  uint8_t isCopyEngineNotSmCopy : 1;
+  uint8_t p2pLevel : 3;
+  static_assert(PATH_SYS <= (1<<3)-1, "must have enough bits");
   union {
     uint64_t unused;
     // For use by enqueue.cc
@@ -65,6 +69,19 @@ struct ncclProxySubArgs {
   uint64_t end;
   void* requests[NCCL_STEPS];
   void* profilingEvents[NCCL_STEPS];
+
+#if defined(ENABLE_NPKIT) && ((defined(ENABLE_NPKIT_EVENT_NET_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_NET_SEND_EXIT)) || (defined(ENABLE_NPKIT_EVENT_P2P_SEND_ENTRY) && defined(ENABLE_NPKIT_EVENT_P2P_SEND_EXIT)))
+  int npKitSizesFifo[NCCL_STEPS];
+#endif
+#if defined(ENABLE_NPKIT_NET_CHECK_LATENCY)
+  int npKitSizesFifo[NCCL_STEPS];
+  uint64_t npKitStartTime[NCCL_STEPS];
+  uint64_t npKitLastPollTime[NCCL_STEPS];
+  uint64_t npKitLastPollInterval[NCCL_STEPS];
+  uint64_t npKitMaxPollInterval[NCCL_STEPS];
+  uint64_t npKitPollIntervalSum[NCCL_STEPS];
+  uint64_t npKitPollCnt[NCCL_STEPS];
+#endif
 };
 
 struct ncclProxyArgs {
@@ -96,7 +113,7 @@ struct ncclProxyArgs {
 // ProxyOps are used to communicate between main thread and service thread
 // Make sure we have enough to store two full rounds of operations on all channels.
 // Otherwise we'd be unable to post half of them to free new elements.
-#define MAX_OPS_PER_PEER (2*MAXCHANNELS*NCCL_MAX_WORK_ELEMENTS_P2P)
+#define MAX_OPS_PER_PEER (2*TUNER_MAXCHANNELS*NCCL_MAX_WORK_ELEMENTS_P2P)
 #define NCCL_MAX_LOCAL_RANKS 64
 struct ncclProxyOpsPool {
   struct ncclProxyOp ops[MAX_OPS_PER_PEER*NCCL_MAX_LOCAL_RANKS];
@@ -123,7 +140,7 @@ struct ncclProxySharedP2p {
   char* hostBuff;
   // CUDA IPC
   ncclIpcDesc ipcDesc;
-  struct ncclProxyArgs* proxyAppend[MAXCHANNELS]; // Separate send and recv
+  struct ncclProxyArgs* proxyAppend[TUNER_MAXCHANNELS]; // Separate send and recv
 };
 
 struct ncclProxyPeer {
@@ -132,10 +149,10 @@ struct ncclProxyPeer {
 };
 
 struct ncclSharedNetComms {
-  void* sendComm[MAXCHANNELS];
-  void* recvComm[MAXCHANNELS];
-  int sendRefCount[MAXCHANNELS];
-  int recvRefCount[MAXCHANNELS];
+  void* sendComm[TUNER_MAXCHANNELS];
+  void* recvComm[TUNER_MAXCHANNELS];
+  int sendRefCount[TUNER_MAXCHANNELS];
+  int recvRefCount[TUNER_MAXCHANNELS];
 };
 
 struct ncclProxyPool;
@@ -277,4 +294,5 @@ ncclResult_t ncclProxyClientConvertFdBlocking(struct ncclComm* comm, struct nccl
 ncclResult_t ncclProxyStop(struct ncclComm* comm);
 ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm);
 ncclResult_t ncclProxyDestroy(struct ncclComm* comm);
+bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks);
 #endif

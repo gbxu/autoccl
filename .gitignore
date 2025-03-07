@@ -2,3 +2,5 @@
 /build
 *.gcov
 /coverage/
+build
+__pycache__

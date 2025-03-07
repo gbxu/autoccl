@@ -12,7 +12,8 @@
 #include "op128.h"
 
 #define COLL_UNROLL (ncclCollUnroll())
-
+#define MAPPING_CHANNEL 1
+#define NATIVE_MAPPING_CHANNEL 0
 typedef void(*ncclKern_t)();
 extern __device__ ncclKern_t ncclFuncs[];
 
@@ -83,6 +84,7 @@ struct RunWork {
     #pragma unroll 1
     while ((char*)we + stride <= (char*)(w+1) && we->isUsed) {
       if (wid < we->nWarps) {
+        GPUPRINT(threadIdx.x == 0, "args->native=%d", we->native);
         RunWorkElement<Fn, T, RedOp, Algo, Proto>().run(we);
       }
       we = (ncclWorkElem*)((char*)we + stride);
@@ -113,12 +115,37 @@ static __device__ void ncclRedopPtrDeref(struct ncclWorkElem* we) {
 
 template<ncclFunc_t Fn, typename T, typename RedOp, int Algo, int Proto, int FnIndex>
 __device__ void ncclKernel(
-    struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead
+    struct ncclDevComm* comm, ChannelMask channelMasks, struct ncclWork* workHead
   )  {
+  GPUPRINT(threadIdx.x % WARP_SIZE == 0, "");
   int tid = threadIdx.x;
 
   // To map blockId to channelId, we need the n'th set bit of channelMask which
   // is the inverse of counting the number of set bits among the the first n.
+#if MAPPING_CHANNEL
+  int round = (TUNER_MAXCHANNELS + blockDim.x - 1) / blockDim.x;
+  for (int i = 0; i < round; ++i) {
+    int channelId = blockDim.x*i+threadIdx.x;
+    if (channelId < TUNER_MAXCHANNELS) {
+      int arrayIndex = channelId / MASK_BITWIDTH;
+      int bitPosition = channelId % MASK_BITWIDTH;
+      if (!(channelMasks.values[arrayIndex] & (1ull << bitPosition))) {
+        continue;
+      }
+      int activeChannel = 0;
+      for (int j = 0; j < arrayIndex; ++j) {
+        activeChannel += __popcll(channelMasks.values[j]);
+      }
+      activeChannel += __popcll(channelMasks.values[arrayIndex] & ((1ull << bitPosition)-1));
+      if (blockIdx.x == activeChannel) {
+        ncclShmem.channelId = channelId;
+        GPUPRINT(true, "channel=%d", ncclShmem.channelId);
+      }
+    }
+  }
+  __syncthreads(); // publish ncclShmem.channelId
+#elif NATIVE_MAPPING_CHANNEL
+  uint64_t channelMask= channelMasks.values[0];
   if (tid < WARP_SIZE) {
     int x = tid;
     if (channelMask & (1ull<<x)) {
@@ -135,6 +162,7 @@ __device__ void ncclKernel(
   }
   __syncthreads(); // publish ncclShmem.channelId
   int channelId = ncclShmem.channelId;
+#endif
   /* set abort flag to 0 */
   if (tid == 0) ncclShmem.aborted = 0;
 
@@ -152,7 +180,13 @@ __device__ void ncclKernel(
     case 1:
       // Get address of channel without incurring indirect load from ncclDevComm::channels
       dst = &ncclShmem.channel;
+#if MAPPING_CHANNEL
+      src = &((ncclDevCommAndChannels*)comm)->channels[ncclShmem.channelId];
+#elif NATIVE_MAPPING_CHANNEL
       src = &((ncclDevCommAndChannels*)comm)->channels[channelId];
+#else
+      src = &((ncclDevCommAndChannels*)comm)->channels[blockIdx.x];
+#endif
       bytes = sizeof(ncclDevChannel);
       static_assert(sizeof(ncclDevChannel) <= 16*WARP_SIZE, "ncclDevChannel cannot be loaded by a single warp in one insn.");
       break;
@@ -202,16 +236,17 @@ __device__ void ncclKernel(
         break;
     }
   }
+  GPUPRINT(threadIdx.x == 0, "done");
 }
 
 // Only generate kernels for SUM
 #if NCCL_OP == 0
 #define IMPL_COLL_KERN(func, algo, proto, devredop, type, fIndex) \
 __global__ void NCCL_KERN_NAME(func, algo, proto, devredop, type)( \
-    struct ncclDevComm* comm, uint64_t channelMask, struct ncclWork* workHead \
+    struct ncclDevComm* comm, ChannelMask channelMasks, struct ncclWork* workHead \
   ) { \
   ncclKernel<ncclFunc##func, type, Func##devredop<type>, NCCL_ALGO_##algo, NCCL_PROTO_##proto, fIndex> \
-    (comm, channelMask, workHead); \
+    (comm, channelMasks, workHead); \
 }
 #else
 #define IMPL_COLL_KERN(func, algo, proto, devredop, type, fInded)

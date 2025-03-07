@@ -16,8 +16,20 @@ namespace {
     const int bid = args->bid;
     const int nChannels = args->nChannels;
     ncclRing *ring = &ncclShmem.channel.ring;
-    const ssize_t chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? REDUCE_CHUNKSTEPS : 1));
-    const ssize_t minChunkSizeLL128 = int(nthreads*(Proto::calcBytePerGrain()/sizeof(T)));
+    ssize_t chunkSize;
+    if (args->native) {
+      chunkSize = int(Proto::calcBytePerStep()/sizeof(T) * (Proto::Id == NCCL_PROTO_SIMPLE ? REDUCE_CHUNKSTEPS : 1));
+    } else {
+      chunkSize = args->effectiveChunkSize;
+    }
+    ssize_t minChunkSize;
+    if (Proto::Id == NCCL_PROTO_LL)
+      minChunkSize = nthreads*(Proto::calcBytePerGrain()/sizeof(T));
+    if (Proto::Id == NCCL_PROTO_LL128) {
+      // We should not need the final /2 but it makes performance much, much smoother. Might be a bug somewhere.
+      minChunkSize = int(nthreads*(Proto::calcBytePerGrain()/sizeof(T))); // minChunkSizeLL128
+    }
+
     const int nranks = ncclShmem.comm.nRanks;
     const ssize_t loopSize = nChannels*chunkSize;
     const ssize_t size = args->count;
@@ -26,24 +38,29 @@ namespace {
     const int root = args->root;
 
     Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0>
-      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
+      prims(tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg, 0, 0, 0, args->transportIndex);
 
     auto calcChunkSize = [&]__device__(ssize_t gridOffset)->int {
       int realChunkSize;
       if (Proto::Id == NCCL_PROTO_SIMPLE) {
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels));
         realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
+      } else if (Proto::Id == NCCL_PROTO_LL) {
+        if (args->native) {
+          realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
+        } else {
+          realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize, chunkSize);
+        }
+      } else if (Proto::Id == NCCL_PROTO_LL128) {
+        realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSize)*minChunkSize, chunkSize);
       }
-      else if (Proto::Id == NCCL_PROTO_LL)
-        realChunkSize = size-gridOffset < loopSize ? args->lastChunkSize : chunkSize;
-      else if (Proto::Id == NCCL_PROTO_LL128)
-        realChunkSize = min(divUp(size-gridOffset, nChannels*minChunkSizeLL128)*minChunkSizeLL128, chunkSize);
       return realChunkSize;
     };
 
     if (prevRank == root) {
       for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
-        int realChunkSize = calcChunkSize(gridOffset);
+        int realChunkSize;
+        realChunkSize = calcChunkSize(gridOffset);
         ssize_t offset = gridOffset + bid*realChunkSize;
         int nelem = min(realChunkSize, size-offset);
         prims.send(offset, nelem);
@@ -51,7 +68,8 @@ namespace {
     }
     else if (rank == root) {
       for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
-        int realChunkSize = calcChunkSize(gridOffset);
+        int realChunkSize;
+        realChunkSize = calcChunkSize(gridOffset);
         ssize_t offset = gridOffset + bid*realChunkSize;
         int nelem = min(realChunkSize, size-offset);
         prims.recvReduceCopy(offset, offset, nelem, /*postOp=*/true);
@@ -59,7 +77,8 @@ namespace {
     }
     else {
       for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
-        int realChunkSize = calcChunkSize(gridOffset);
+        int realChunkSize;
+        realChunkSize = calcChunkSize(gridOffset);
         ssize_t offset = gridOffset + bid*realChunkSize;
         int nelem = min(realChunkSize, size-offset);
         prims.recvReduceSend(offset, nelem);

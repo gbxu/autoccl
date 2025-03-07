@@ -50,6 +50,8 @@ struct ncclInfo {
   ncclDevRedOpFull opFull;
   int algorithm;
   int protocol;
+  int isCopyEngineNotSmCopy;
+  int p2pLevel;
   ncclPattern_t pattern;
   int nChannels;
   int nThreads;
@@ -88,6 +90,7 @@ struct ncclTaskP2p {
   // Stateful chunk index. If a p2p gets "cut" over two plans this keeps track
   // of where it left off.
   int chunk;
+  int peer;
 };
 
 struct ncclCudaStreamList {
@@ -100,6 +103,37 @@ struct ncclTasks {
     struct ncclIntruQueue<struct ncclTaskP2p, &ncclTaskP2p::next> sendQueue;
     struct ncclIntruQueue<struct ncclTaskP2p, &ncclTaskP2p::next> recvQueue;
   };
+  struct Backup {
+    // backup for Tuner
+    struct ncclIntruQueue<ncclTaskColl, &ncclTaskColl::next> collQueue;
+    size_t collBytesTotal;
+    struct Peer* peers/*[nRanks]*/;
+    int nTasksColl, nTasksP2p;
+  };
+  Backup backup;
+  // for 1 plan: workload, candidate
+  struct Workload {
+    uint64_t commHash;
+    ncclFunc_t collType;
+    size_t nBytes;
+  };
+  Workload workload;
+  struct Candidate {
+    int algorithm;
+    int protocol;
+    int isCopyEngineNotSmCopy;
+    int p2pLevel;
+    int nChannels;
+    int nThreads;
+    int wireChunksize;
+    int iteration;
+    int lastIterEffectiveChunksize;
+    int native;
+    bool initialized = false;
+    int nThreadsTotal;
+  };
+  Candidate candidate; // 0 for native; 1 for tuner
+
   struct ncclIntruQueue<ncclTaskColl, &ncclTaskColl::next> collQueue;
   size_t collBytesTotal;
   struct Peer* peers/*[nRanks]*/;

@@ -13,6 +13,7 @@ TRACE ?= 0
 PROFAPI ?= 1
 NVTX ?= 1
 RDMA_CORE ?= 0
+TUNER_MAXCHANNELS ?= 128
 
 NVCC = $(CUDA_HOME)/bin/nvcc
 
@@ -58,14 +59,19 @@ $(info NVCC_GENCODE is ${NVCC_GENCODE})
 
 CXXFLAGS   := -DCUDA_MAJOR=$(CUDA_MAJOR) -DCUDA_MINOR=$(CUDA_MINOR) -fPIC -fvisibility=hidden \
               -Wall -Wno-unused-function -Wno-sign-compare -std=c++11 -Wvla \
-              -I $(CUDA_INC) \
+              -I $(CUDA_INC) $(NPKIT_FLAGS) \
               $(CXXFLAGS)
 # Maxrregcount needs to be set accordingly to NCCL_MAX_NTHREADS (otherwise it will cause kernel launch errors)
 # 512 : 120, 640 : 96, 768 : 80, 1024 : 60
 # We would not have to set this if we used __launch_bounds__, but this only works on kernels, not on functions.
-NVCUFLAGS  := -ccbin $(CXX) $(NVCC_GENCODE) -std=c++11 --expt-extended-lambda -Xptxas -maxrregcount=96 -Xfatbin -compress-all
+NVCUFLAGS  := -ccbin $(CXX) $(NVCC_GENCODE) -std=c++11 --expt-extended-lambda -Xptxas -maxrregcount=96 -Xfatbin -compress-all  --resource-usage $(NPKIT_FLAGS)
 # Use addprefix so that we can specify more than one path
 NVLDFLAGS  := -L${CUDA_LIB} -lcudart -lrt
+
+#########
+CXXFLAGS   += -DTUNER_MAXCHANNELS=${TUNER_MAXCHANNELS}
+NVCUFLAGS  += -DTUNER_MAXCHANNELS=${TUNER_MAXCHANNELS}
+##########  ##########
 
 ########## GCOV ##########
 GCOV ?= 0 # disable by default.

@@ -1,76 +1,61 @@
-# NCCL
+## Prepare the docker
+```
+docker pull nvcr.io/nvidia/pytorch:23.08-py3
+```
 
-Optimized primitives for inter-GPU communication.
+## Download source code
+```
+git clone --recursive https://github.com/gbxu/autoccl.git
+```
 
-## Introduction
-
-NCCL (pronounced "Nickel") is a stand-alone library of standard communication routines for GPUs, implementing all-reduce, all-gather, reduce, broadcast, reduce-scatter, as well as any send/receive based communication pattern. It has been optimized to achieve high bandwidth on platforms using PCIe, NVLink, NVswitch, as well as networking using InfiniBand Verbs or TCP/IP sockets. NCCL supports an arbitrary number of GPUs installed in a single node or across multiple nodes, and can be used in either single- or multi-process (e.g., MPI) applications.
-
-For more information on NCCL usage, please refer to the [NCCL documentation](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html).
-
-## Build
-
-Note: the official and tested builds of NCCL can be downloaded from: https://developer.nvidia.com/nccl. You can skip the following build steps if you choose to use the official builds.
-
-To build the library :
+## To build the library :
 
 ```shell
-$ cd nccl
-$ make -j src.build
+cd autoccl
+make -j src.build
 ```
 
 If CUDA is not installed in the default /usr/local/cuda path, you can define the CUDA path with :
 
 ```shell
-$ make src.build CUDA_HOME=<path to cuda install>
+make src.build CUDA_HOME=<path to cuda install>
 ```
 
-NCCL will be compiled and installed in `build/` unless `BUILDDIR` is set.
+AutoCCL will be compiled and installed in `build/` unless `BUILDDIR` is set.
 
-By default, NCCL is compiled for all supported architectures. To accelerate the compilation and reduce the binary size, consider redefining `NVCC_GENCODE` (defined in `makefiles/common.mk`) to only include the architecture of the target platform :
+By default, AutoCCL is compiled for all supported architectures. To accelerate the compilation and reduce the binary size, consider redefining `NVCC_GENCODE` (defined in `makefiles/common.mk`) to only include the architecture of the target platform :
 ```shell
 $ make -j src.build NVCC_GENCODE="-gencode=arch=compute_70,code=sm_70"
 ```
 
-## Install
-
-To install NCCL on the system, create a package then install it as root.
-
-Debian/Ubuntu :
+## Build AutoCCL Tuner
 ```shell
-$ # Install tools to create debian packages
-$ sudo apt install build-essential devscripts debhelper fakeroot
-$ # Build NCCL deb package
-$ make pkg.debian.build
-$ ls build/pkg/deb/
+$ cd ext-tuner/example && make clean && make
 ```
 
-RedHat/CentOS :
-```shell
-$ # Install tools to create rpm packages
-$ sudo yum install rpm-build rpmdevtools
-$ # Build NCCL rpm package
-$ make pkg.redhat.build
-$ ls build/pkg/rpm/
+## Use AutoCCL
+We assume that in a distributed scenario, each CPU process is responsible for managing a GPU.
+
+* Preload runtime and tuner to bypass Tccl on the system
+```sh
+# Setting environment variables on each process
+export LD_PRELOAD=path/to/autoccl/build/lib/libnccl.so
+export LD_LIBRARY_PATH=path/to/autoccl/build/lib:path/to/autoccl/ext-tuner/example/build/:$LD_LIBRARY_PATH
+export NCCL_TUNER_PLUGIN=path/to/autoccl/ext-tuner/example/build/libnccl-plugin.so
 ```
 
-OS-agnostic tarball :
-```shell
-$ make pkg.txz.build
-$ ls build/pkg/txz/
+* Specify the ip and port of the monitoring process
+```sh
+# Setting environment variables on each process
+export TUNER_COORDINATOR="coordinator_node_ip:port"
+export TUNER_WORLDSIZE="YOUR_COMM_GROUP_SIZE"
 ```
 
-## Tests
-
-Tests for NCCL are maintained separately at https://github.com/nvidia/nccl-tests.
-
-```shell
-$ git clone https://github.com/NVIDIA/nccl-tests.git
-$ cd nccl-tests
-$ make
-$ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
+* Specify a process on the coordinator node to create an additional thread to act as a coordinator responsible for listening to the coordinator_node_ip:port.
+```sh
+# Setting environment variables only on a certain process
+export TUNER_ROLE="COORDINATOR"
 ```
 
-## Copyright
-
-All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
+## Example
+see  `autoccl/ext-tuner/example/example/cuda/pytorch/run.sh`
