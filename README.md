@@ -59,3 +59,21 @@ export TUNER_ROLE="COORDINATOR"
 
 ## Example
 see  `autoccl/ext-tuner/example/example/cuda/pytorch/run.sh`
+
+
+## Citation
+If you use autoccl in a scientific publication, we encourage you to add the following reference to the related papers:
+```
+@inproceedings {xu2025autoccl,
+    author = {Guanbin Xu and Zhihao Le and Yinhe Chen and Zhiqi Lin and Zewen Jin and Youshan Miao and Cheng Li},
+    title = {{AutoCCL}: Automated Collective Communication Tuning for Accelerating Distributed and Parallel {DNN} Training},
+    booktitle = {22nd USENIX Symposium on Networked Systems Design and Implementation (NSDI 25)},
+    year = {2025},
+    isbn = {978-1-939133-46-5},
+    address = {Philadelphia, PA},
+    pages = {667--683},
+    url = {https://www.usenix.org/conference/nsdi25/presentation/xu-guanbin},
+    publisher = {USENIX Association},
+    month = apr
+}
+```
